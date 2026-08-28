@@ -5,7 +5,7 @@
 
 This repository contains functions and rmarkdown files which contain code used to process and analyse the data that are published at [link when available]. The structure of the repository is as follows:
 
-
+```
 ├── R
 │   └── scfunctions.R
 ├── README.md
@@ -30,5 +30,6 @@ This repository contains functions and rmarkdown files which contain code used t
         ├── Mouse_Ileum.Rmd
         ├── QC.Rmd
         └── Spatial_Ileum_Epithelium.Rmd
+```
 
 The analyses are based on pre-processed scRNA-seq, LC-MS bulk proteomics and bulk RNA-seq - pre-processing was performed using commandline tools as described in the accompanying manuscript. Processed data used for the analyses and compatible with the code in this repo can be found at figshare in the collection [add link when ready].
