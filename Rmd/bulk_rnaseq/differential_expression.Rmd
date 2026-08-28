@@ -1,0 +1,487 @@
+---
+title: "This is a bulk RNA-seq analysis of PSC-UC, UC and Healthy controls"
+output: 
+  html_document:
+    theme: cosmo
+    toc: yes
+    toc_float:
+      collapsed: true
+date: "`r Sys.Date()`"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(bitmapType = "cairo")
+```
+
+```{r load libraries, echo=FALSE, message=FALSE, warning=FALSE}
+
+library(DESeq2)
+library(ComplexHeatmap)
+library(ggplot2)
+library(tidyr)
+library(fgsea)
+library(tximport)
+source("/well/powrie/shared/proj064/MIGTranscriptome_retrieval.R")
+source("/well/powrie/shared/proj064/MIGTranscriptome_plotting.R")
+library(OCMSutility)
+library(RColorBrewer)
+#source("convenience_functions.R")
+source("~/devel/NGSKit/R/kmeans_helper.R")
+
+if (!(dir.exists("export.dir"))){
+  dir.create("export.dir")
+}
+
+# metadata is same as proteomics data
+metadata <- read.csv("../../qc/export.dir/metadata_clean.tsv",
+                     header=TRUE,
+                     stringsAsFactors = FALSE,
+                     sep = "\t")
+rownames(metadata) <- metadata$UID
+                 
+```
+
+## Overview
+
+These are RNA-seq data that are part of a set of ileum samples that also had proteomics and metabolomics performed on them.
+
+
+```{r read in data, echo=FALSE, message=FALSE, warning=FALSE}
+
+# transcript2gene mapping
+tx2gene <- read.csv("~/work/proj080/analysis/rnaseq/kallisto/transcripts2genes.dir/transcripts2genes.tsv", header=TRUE, stringsAsFactors=FALSE, sep="\t")
+
+files <- list.files(".")[grep("*abundance.tsv", list.files("."))]
+names(files) <- gsub("_abundance.tsv", "", files)
+
+txi <- tximport(paste0(".", "/", files), type = "kallisto", tx2gene = tx2gene)
+
+# create column names that match the metadata
+counts <- as.data.frame(txi$counts)
+colnames(counts) <- names(files)
+
+# just make sure everything is in everything
+samples <- intersect(rownames(metadata), colnames(counts))
+counts <- counts[,samples]
+metadata <- metadata[samples,]
+
+# map colors - try and make the diagnosis names without
+# hyphens in
+metadata$diagnosis <- gsub("-", "", metadata$diagnosis)
+group_colors <- c("red3", blues9[5], "grey")
+names(group_colors) <- c("UC", "PSCUC", "HC")
+
+```
+
+
+
+```{r gene id to gene names, echo=FALSE, message = FALSE, warning=FALSE}
+
+geneid2genename <- read.csv("/well/powrie/users/utu691/work/proj080/analysis/rnaseq/gene_names/geneid2genenames2.tsv",
+                            header=TRUE,
+                            stringsAsFactors=FALSE,
+                            sep="\t")
+rownames(geneid2genename) <- geneid2genename$gene_id
+
+```
+
+## Counts per group
+
+The first thing to check is just that the number of reads coming from each condition is equivalent. From the kallisto pseudoalignment we saw ~80% of reads could be pseudoaligned and so the data should be of high quality for differential expression analysis.
+
+```{r read counts, echo=FALSE, message=FALSE, warning=FALSE, fig.height=5, fig.width=7}
+
+counts_to_plot <- data.frame(sample=rownames(metadata),
+                             group=metadata$diagnosis,
+                            count=colSums(counts))
+
+ggplot(counts_to_plot, aes(x=group, y=count, color=group)) +
+  geom_boxplot() +
+  geom_jitter(height=0, width=0.1) +
+  theme_classic() +
+  ggpubr::stat_compare_means() +
+  scale_color_manual(values = group_colors)
+
+```
+
+Although there looks by eye to be some difference in counts between groups this is not significant and is unlikely to affect downstream analysis. 
+
+```{r aggregate counts, echo = FALSE, message = FALSE}
+
+counts_agg <- aggregate(counts, by = list(geneid2genename[rownames(counts),]$gene_name),
+                        FUN = "mean")
+
+rownames(counts_agg) <- counts_agg$Group.1
+counts_agg <- counts_agg[,2:ncol(counts_agg)]
+counts_agg <- round(counts_agg, 0)
+
+# cpm for DSSC
+counts_cpm <- edgeR::cpm(counts_agg)
+
+# write out the cpm
+write.table(data.frame(gene = rownames(counts_cpm),
+                       counts_cpm),
+            file = "export.dir/cpm.tsv",
+            sep = "\t",
+            quote = FALSE,
+            row.names = FALSE)
+
+# write out the cpm
+write.table(data.frame(gene = rownames(counts_agg),
+                       counts_agg),
+            file = "export.dir/counts.tsv",
+            sep = "\t",
+            quote = FALSE,
+            row.names = FALSE)
+
+```
+
+
+## PCA
+
+This is a PCA of everything to begin with.
+
+```{r differential expression, echo=FALSE, message=FALSE, warning=FALSE}
+
+# Make age group variable
+metadata$agegroup <- ifelse(metadata$age >= 17 & metadata$age <= 25, "group1", NA)
+metadata$agegroup <- ifelse(metadata$age >= 26 & metadata$age <= 35, "group2", metadata$agegroup)
+metadata$agegroup <- ifelse(metadata$age >= 36 & metadata$age <= 45, "group3", metadata$agegroup)
+metadata$agegroup <- ifelse(metadata$age >= 46 & metadata$age <= 55, "group4", metadata$agegroup)
+metadata$agegroup <- ifelse(metadata$age >= 56, "group5", metadata$agegroup)
+
+# impute for missing
+metadata$agegroup <- ifelse(is.na(metadata$agegroup), "group5", metadata$agegroup)
+
+
+# change the disease so it doesn't have odd characters in it
+metadata$diagnosis <- ifelse(metadata$diagnosis == "PSC-UC", "PSCUC", metadata$diagnosis)
+
+dds <- DESeqDataSetFromTximport(txi, colData = metadata[names(files),], design=~diagnosis)
+dds <- dds[,rownames(metadata)]
+
+# and the age object
+#dds_age <- DESeqDataSetFromTximport(txi, colData = metadata[names(files),], design=~agegroup)
+#dds_age <- dds_age[,rownames(metadata)]
+
+
+if (!(file.exists("export.dir/transformed_counts.tsv"))){
+  
+  # transformed count data
+  transformed_counts <- as.data.frame(assay(vst(dds)))
+  to_write <- data.frame(gene_id = rownames(transformed_counts), transformed_counts)
+  
+  write.table(to_write,
+              file="export.dir/transformed_counts.tsv",
+              sep="\t",
+              quote=FALSE,
+              row.names=FALSE)
+}
+
+transformed_counts <- read.csv("export.dir/transformed_counts.tsv",
+                               sep="\t",
+                               row.names=1)
+
+```
+
+### Expression distribution and PCA
+
+This gives us a general sense of where to filter genes based on expression level - usually ~7.
+
+```{r distribution, echo=FALSE, message=FALSE, warning=FALSE, fig.height=5, fig.width=5}
+
+names(group_colors) <- c("UC", "PSCUC", "HC")
+
+transformed_counts <- as.data.frame(transformed_counts)
+t_m <- reshape2::melt(transformed_counts)
+ggplot(t_m, aes(x=value)) + 
+  geom_histogram() + 
+  theme_classic() + 
+  geom_vline(xintercept = 7, linetype="dashed")
+```
+
+```{r pca, echo=FALSE, message=FALSE, fig.height=5, fig.width=12, warning=FALSE}
+transformed_counts <- transformed_counts[rowSums(transformed_counts > 7) >= 5, rownames(metadata)]
+pc <- runPCA(transformed_counts, scale=FALSE)
+
+p1 <- plotPrincipleComponents(pc, metadata, group="diagnosis", colourby="diagnosis", pcs=c("PC1", "PC2")) +
+  scale_color_manual(values = group_colors) +
+  theme_classic() +
+  stat_ellipse() +
+  ggtitle("Disease status")
+
+p2 <- plotPrincipleComponents(pc, metadata, group="agegroup", colourby="agegroup", pcs=c("PC1", "PC2")) +
+  theme_classic() +
+  stat_ellipse() +
+  ggtitle("Age group")
+
+p3 <- plotPrincipleComponents(pc, metadata, group="Sex..dropdown..M..F.", colourby="Sex..dropdown..M..F.", pcs=c("PC1", "PC2")) +
+  theme_classic() +
+  stat_ellipse() +
+  ggtitle("Sex")
+
+p4 <- plotPrincipleComponents(pc, metadata, colourby="ALP", pcs=c("PC1", "PC2"), continuous = TRUE) +
+  theme_classic() +
+  ggtitle("ALP") +
+  scale_color_gradient2()
+
+gridExtra::grid.arrange(p1, p2, p3, p4, nrow = 2)
+
+metadata$sex <- metadata$Sex..dropdown..M..F.
+
+set.seed(10)
+vegan::adonis2(t(transformed_counts[,metadata$UID]) ~ diagnosis + agegroup + sex + ALP,
+               data = metadata, by = "margin", na.action = na.omit)
+
+```
+
+There is some hints that ALP is associated with transcriptional profiles. This is potentially of interest as we see that some PSC patients have normal ALP levels where a small subset are high. Next we look at the PCA but instead use a separate grouping of PSC who are ALP high vs. low. Taken as High >= 162 (1.5x the max of ALP of healthy controls).
+
+
+## PCA with ALP groupings
+
+
+```{r pca with ALP groupings, echo = FALSE, message = FALSE}
+
+metadata_no_na <- metadata[!is.na(metadata$ALP),]
+
+#metadata_no_na$ALP <- scale(metadata_no_na$ALP)
+metadata_no_na$ALPbin <- ifelse(metadata_no_na$ALP >= 162, "High", "Low")
+
+metadata_no_na$diagnosis <- paste0(metadata_no_na$diagnosis, metadata_no_na$ALPbin)
+
+# new group colors
+new_group_colors <- group_colors
+new_group_colors <- append(new_group_colors, blues9[8])
+names(new_group_colors) <- c("UCLow", "PSCUCLow", "HCLow", "PSCUCHigh")
+
+pc <- runPCA(transformed_counts[,metadata_no_na$UID], scale=FALSE)
+p_newgroups <- plotPrincipleComponents(pc, metadata_no_na, group="diagnosis", colourby="diagnosis", pcs=c("PC1", "PC2")) +
+  scale_color_manual(values = new_group_colors) +
+  theme_classic() +
+  stat_ellipse()
+
+p_newgroups
+ggsave(p_newgroups, file = "export.dir/pca_rna.pdf", height = 2.5, width = 4)  
+
+
+vegan::adonis2(t(transformed_counts[,metadata_no_na$UID]) ~ diagnosis + ALP + agegroup + sex, data = metadata_no_na, by = "margin")
+
+```
+
+Doens't seem to have much of an overall effect on the associations seen.
+
+
+## Differential expression
+
+Here I am keeping the subgrouping of patients with PSC.
+
+
+```{r each vs. healthy, echo=FALSE, message=FALSE, warning=FALSE}
+
+counts <- round(txi$counts, 0)
+colnames(counts) <- names(files)
+
+dds <- DESeqDataSetFromMatrix(counts[,metadata_no_na$UID], colData = metadata_no_na, design=~agegroup + sex + diagnosis)
+
+dds <- dds[,rownames(metadata_no_na)]
+colData(dds)$diagnosis <- relevel(colData(dds)$diagnosis, ref = "HCLow")
+
+
+# filter for genes
+dds <- dds[rownames(transformed_counts),] 
+dds <- DESeq(dds)
+
+# get the contrasts
+contrasts <- resultsNames(dds)
+
+# get all of the results into a single data frame
+results <- list()
+for (i in contrasts){
+  if (i == "Intercept"){
+    next}
+  if (i == "ALP"){
+    next}
+  else{
+  contrast <- unlist(strsplit(i, "_"))
+  contrast <- c(contrast[1], contrast[2], contrast[4])}
+  print(contrast)
+  res <- lfcShrink(dds,
+                   contrast=contrast,
+                   res=results(dds, contrast=contrast),
+                   type="normal")
+  res <- as.data.frame(res)
+
+  res$gene_id <- rownames(res)
+  res$contrast <- contrast[2]
+  results[[contrast[2]]] <- res
+  
+}
+results <- dplyr::bind_rows(results)
+
+# add gene name to results
+results$gene_name <- geneid2genename[results$gene_id,]$gene_name 
+
+# write the results
+write.table(results, file = "export.dir/results_all.tsv",
+            row.names=FALSE,
+            quote=FALSE,
+            sep="\t")
+
+
+# Aggregate expression over genes
+genes_to_agg <- geneid2genename[rownames(transformed_counts),]$gene_name
+transformed_counts_sym <- aggregate(transformed_counts, by = list(genes_to_agg), FUN = "mean")
+
+rownames(transformed_counts_sym) <- transformed_counts_sym$Group.1
+transformed_counts_sym <- transformed_counts_sym[,2:ncol(transformed_counts_sym)]
+
+# write out the transformed counts - will be useful for
+# comparing to the proteomics data
+write.table(data.frame(gene = rownames(transformed_counts_sym),
+                       transformed_counts_sym),
+            file = "export.dir/transformed_counts_symbols.tsv",
+            sep = "\t",
+            quote = FALSE,
+            row.names = FALSE)
+
+
+```
+
+## Fgsea of GSTA1-associated genes
+
+```{r fgsea gsta1, echo = FALSE, message = FALSE}
+
+gsta1_genes <- list(GSTA1_Module = c("GSTA1", "MT1H", "MT1M", "HLA-B", "MT1G", "MT1F", "ACTB", "CCL25", "TMSB10", "FABP1", "FABP6", "KRT8", "LCN2", "REG1A", "FAM151A", "PIGR", "RBP2"))
+
+sub_dat <- subset(results, subset = contrast == "PSCUCHigh")
+input_genes <- sub_dat$log2FoldChange
+names(input_genes) <- sub_dat$gene_name 
+
+fgsea_res_gsta <- fgsea(gsta1_genes, input_genes)
+
+
+```
+
+
+
+## Results for genes of interest
+
+These are the results for the genes of interest i.e. GSTA-associated genes that are downregulated in PSC enterocytes.
+
+```{r gois results, echo = FALSE, message = FALSE}
+
+gois_results <- as.data.frame(subset(results, subset = gene_name %in% gsta1_genes[["GSTA1_Module"]]))
+
+knitr::kable(subset(gois_results, subset = contrast == "PSCUCHigh"))
+
+```
+
+GSTA1 and GGT1 show decreased expression. Only focus on these - these are more explicitly detoxification genes so are of interest.
+
+## Plotting some genes of interest
+
+```{r gois, echo = FALSE, message = FALSE}
+
+gois <- c("GSTA1",  "MT1H", "MT1F")
+
+detox_genes <- featurebox(transformed_counts_sym[,metadata_no_na$UID],
+               metadata_no_na,
+               group_by = "diagnosis",
+               features = gois) +
+  facet_wrap(~feature, scales = "free") +
+  theme_classic() +
+  scale_color_manual(values = new_group_colors) +
+  theme(axis.text.x = element_text(hjust = 1, angle = 45)) +
+  theme(legend.position = "none")
+
+detox_genes
+ggsave(detox_genes, file = "export.dir/rna_gois_featurebox.pdf", height = 2.5, width = 5)
+```
+
+
+## Gene set enrichment analysis
+
+This is a fgsea of ALP associated genes - ranking by fold change i.e. the differential expression analysis of the PSC-UC; ALP High group compared to Healthy controls.
+
+```{r fgsea, echo = FALSE, message = FALSE}
+
+res_alp <- subset(results, subset = contrast == "PSCUCHigh")
+genes <- res_alp$log2FoldChange
+names(genes) <- res_alp$gene_name
+
+genes <- genes[!is.na(names(genes))]
+genes <- genes[is.finite(genes)]
+
+pathways <- gmtPathways("~/mirror/msigdb/msigdb_v7.1/msigdb_v7.1_GMTs/c5.bp.v7.1.symbols.gmt")
+
+#detox <- pathways[names(pathways) == "GO_DETOXIFICATION"]
+
+fgsea_res <- fgsea(pathways, genes, minSize = 20, maxSize = 200)
+fgsea_res <- fgsea_res[order(fgsea_res$padj, decreasing = FALSE),]
+
+ggplot(fgsea_res[1:10,], aes(x = pathway, y = NES)) +
+  geom_bar(stat = "identity", color = "black", fill = "snow2") +
+  theme_classic() +
+  coord_flip()
+
+```
+
+Mainly Ig related genes.
+
+## Have a look at some of the interesting pathways
+
+```{r fgsea results genes, echo = FALSE, message = FALSE}
+
+OCMSutility::featurebox(transformed_counts_sym[,metadata_no_na$UID],
+                        metadata_no_na,
+                        features = c("IGHV3-43", "IGHV1-24", "IGHV2-26", "IGHV1-69D"),
+                        group_by = "diagnosis") +
+  facet_wrap(~feature, scales = "free") +
+  scale_color_manual(values = new_group_colors) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+## PCA with the new diagnosis split
+
+Here we look at the PCA with the ALP high and Low groupings to see if there is any additional insight from that.
+
+```{r pca new, echo = FALSE, message = FALSE}
+
+pc_new <- runPCA(transformed_counts_sym[,metadata_no_na$UID])
+
+plotPrincipleComponents(pc_new,
+                        metadata_no_na,
+                        colourby = "diagnosis",
+                        group = "diagnosis") +
+  theme_classic() +
+  stat_ellipse() +
+  scale_color_manual(values = group_colors)
+  
+set.seed(10)
+vegan::adonis2(t(transformed_counts_sym[,metadata_no_na$UID]) ~ diagnosis + agegroup + sex,
+               data = metadata_no_na,
+               by = "margin",
+               na.action = na.omit,
+               method = "euclidean")
+
+# write out the metadata - can use for the metabolomics analysis
+write.table(metadata_no_na,
+            file = "export.dir/metadata_alp_combined.tsv",
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE)
+
+```
+
+
+
+
+
+
+

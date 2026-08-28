@@ -1,0 +1,626 @@
+---
+title: "Caecum epithelial analysis: Forced cells 10000"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo=FALSE}
+
+
+# temporary solution to libpaths
+.libPaths("~/R/x86_64-pc-linux-gnu-library/4.3/")
+
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(dev.args=list(png=list(type="cairo")))
+options(bitmapType = "cairo")
+
+# reticulate stuff
+reticulate::use_virtualenv('~/devel/venv/Python-3.10.8-GCCcore-12.2.0/skylake/', required=TRUE)
+knitr::opts_knit$set(root.dir="/well/powrie/users/utu691/work/proj072/analysis/final_analysis")
+```
+
+```{r load libraries, echo=FALSE, message=FALSE}
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+source("~/devel/proj060/code/R/gex_helper.R")
+source("~/devel/proj072/R/scfunctions.R")
+library(RColorBrewer)
+library(fgsea)
+library(futile.logger)
+library(harmony)
+library(speckle)
+library(scWGCNA)
+library(circlize)
+library(ggraph)
+library(igraph)
+library(DESeq2)
+
+
+# create Clustering analysis dir
+if (!(dir.exists("export.dir/Epithelium"))){
+  dir.create("export.dir/Epithelium")
+}
+```
+
+
+```{r set colors, echo=FALSE, message=FALSE, warning=FALSE}
+
+group_colors <- list("UC" = "red3", "PSCUC" = blues9[6], "HC" = "grey")
+
+```
+
+# Overview
+
+We will need to organise data analysis by cell types. There are some that will not have enough cells to perform pseudobulk for example but we can determine this as we go along. In this doc I am going to look at the epithelial compartment.
+
+```{r read data merged caecum, echo=FALSE, message=FALSE}
+
+merged_caecum <- readRDS("export.dir/Clustering/caecum_harmonised_force_cells_annotated.Rds")
+
+# read in metadata
+metadata <- read.csv("/well/powrie/projects/proj072/analysis/GEX/05_cellranger_pipeline/samples.tsv",
+                     header=TRUE,
+                     stringsAsFactors = FALSE,
+                     sep="\t",
+                     row.names=2)
+```
+
+```{r subset for epithelial cells, echo=FALSE, message=FALSE}
+
+epithelium <- subset(merged_caecum, idents = c("Colonocyte",
+                                              "Colonocyte_2",
+                                              "Colonocyte_BEST4_OTOP2",
+                                              "Tuft_Cell",
+                                              "Goblet_Contaminated[B_Cell]"))
+
+
+
+
+```
+
+## Re-clustering of epithelial cells {.tabset .tabset-pills}
+
+Here we recluster just the epithelial cells.
+
+```{r recluster epithelium, echo=FALSE, message=FALSE}
+
+set.seed(10)
+
+# recluster etc
+epithelium <- ScaleData(epithelium, features = rownames(epithelium))
+epithelium <- FindVariableFeatures(epithelium, selection.method = "vst", nfeatures = 2000)
+epithelium <- RunPCA(epithelium, features = VariableFeatures(object = epithelium))
+
+# harmony integration: by individual = orig.ident
+epithelium <- epithelium %>% 
+RunHarmony("orig.ident", plot_convergence = TRUE)
+epithelium <- FindNeighbors(epithelium, reduction="harmony", dims = 1:30)
+epithelium <- FindClusters(epithelium, resolution = 0.5, algorithm = 4)
+epithelium <- RunUMAP(epithelium, dims = 1:30, reduction = "harmony")
+```
+
+### UMAP
+
+```{r epitheilum umap, echo=FALSE, message=FALSE}
+
+DimPlot(epithelium, label=TRUE, reduction = "umap")
+
+```
+
+### UMAP by sample
+
+```{r epithelium umamp by sample, echo = FALSE, message = FALSE}
+
+DimPlot(epithelium, label=TRUE, reduction = "umap", split.by = "orig.ident")
+
+```
+
+### G-SCI7T094-SCI5T094 - caecum that looks like ileum
+
+One caecum sample looks a bit like ileum in that it has enterocytes i.e. high SLC10A2, FABP6 cells. Here we investigate this sample in a bit more detail.
+
+
+```{r G-SCI7T094-SCI5T094, echo = FALSE, message = FALSE}
+
+# read in the ileum data as well
+ileum_epi <- readRDS("export.dir/Epithelium/ileum_epithelium_clusters_annotated.Rds")
+
+SCI5T082 <- subset(ileum_epi, subset = orig.ident == "G-SCI7T082-SCI5T082")
+Idents(SCI5T082) <- SCI5T082@meta.data$orig.ident
+
+SCI5T094 <- subset(epithelium, subset = orig.ident == "G-SCI7T094-SCI5T094")
+Idents(SCI5T094) <- SCI5T094@meta.data$orig.ident
+
+# an actual caecum
+SCI5T046 <- subset(epithelium, subset = orig.ident == "G-SCI7T046-SCI5T046")
+Idents(SCI5T046) <- SCI5T046@meta.data$orig.ident
+
+gi9593 <- merge(merge(SCI5T082, SCI5T094), SCI5T046)
+
+set.seed(10)
+
+# recluster etc
+gi9593 <- ScaleData(gi9593, features = rownames(gi9593))
+gi9593 <- FindVariableFeatures(gi9593, selection.method = "vst", nfeatures = 2000)
+gi9593 <- RunPCA(gi9593, features = VariableFeatures(object = gi9593))
+
+gi9593 <- gi9593 %>% 
+RunHarmony("orig.ident", plot_convergence = TRUE)
+
+gi9593 <- FindNeighbors(gi9593, reduction="harmony", dims = 1:30)
+gi9593 <- FindClusters(gi9593, resolution = 0.5, algorithm = 4)
+gi9593 <- RunUMAP(gi9593, dims = 1:30, reduction = "harmony")
+
+gi9593_dplot <- DimPlot(gi9593, label = TRUE, split.by = "orig.ident")
+
+FeaturePlot(gi9593, features = c("SLC10A2", "FABP6", "CA1"), split.by = "orig.ident")
+
+```
+
+
+### Dotplot of markers
+
+```{r dotplot epithelium, echo=FALSE, message=FALSE, width = 11}
+
+# find markers for exploration
+epithelium <- JoinLayers(epithelium)
+epi_markers <- FindAllMarkers(epithelium, only.pos = TRUE)
+
+epithelial_cell_genes <- c("EPCAM",
+                           "VIL1",  
+                          "FABP6",
+                          "FABP1",
+                          "CEACAM7",
+                          "CEACAM1",
+                          "AQP8",
+                          "KRT19",
+                          "KRT8",
+                          "APOA1",
+                          "APOB",
+                          "DEFA5",
+                          "DEFA6",
+                          "REG3A",
+                          "SLC10A2",
+                          "GSTA2",
+                          "GSTA1",
+                          "DUOX2",
+                          "DUOXA2",
+                          "TPT1",
+                          "LGR5",
+                          "OLFM4",
+                          "RGMB",
+                          "SMOC2",
+                          "ASCL2",
+                          "MKI67",
+                          "PCNA",
+                          "TOP2A",
+                          "CCNA2",
+                          "POU2F3",
+                          "GFI1B",
+                          "TRPM5",
+                          "DCLK1",
+                          "CLCA1",
+                          "MUC5AC",
+                          "SPINK4",
+                          "TFF3",
+                          "AGR2",
+                          "SPARC",
+                          "CPE",
+                          "NEUROD1",
+                          "BEST4",
+                          "OTOP2")
+
+dplot_epi <- DotPlot(epithelium,
+             cols = colorRampPalette(c("blue", "red"))(2),
+             features=c(epithelial_cell_genes),
+             cluster.idents = TRUE) +
+             theme(axis.text.x = element_text(angle=45, hjust=1)) 
+
+dplot_epi
+
+```
+
+## Score cell cycle
+
+```{r cell cycle, echo=FALSE, message=FALSE}
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+epithelium <- CellCycleScoring(epithelium, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+
+DimPlot(epithelium, label=TRUE, split.by="disease_type")
+Idents(epithelium) <- epithelium@meta.data$seurat_clusters
+```
+
+Proliferating cells will be the TA so will not regress out actually.
+
+
+## Annotation
+
+The main thing here is to pick out the most relevant populations. If there are some that seem sketchy then they will be removed and we will only keep those that have robust markers associated with them. There are no really good markers that distinguish cluster 3.
+
+```{r annotation epithelium, echo=FALSE, message=FALSE}
+
+# annotations
+annotations_epi <- c("Colonocyte",
+                     "Colonocyte",
+                     "Colonocyte_Enterocyte",
+                     "Colonocyte_AQP8",
+                     "Tuft_Cell",
+                     "Colonocyte_BEST4_OTOP2",
+                     "Goblet_Cell",
+                     "Colonocyte_DUOX2",
+                     "Contaminated",
+                     "Contaminated")
+                                          
+
+names(annotations_epi) <- levels(epithelium)
+epithelium <- RenameIdents(epithelium, annotations_epi)
+
+
+# remove contamination clusters
+epithelium <- subset(epithelium, idents = c("Contaminated"),
+                                            invert=TRUE)
+
+# remove dodgy sample that has the enterocyte high proportion. Should remove this from the
+# immune cell analysis as well just in case it is a weirdness thing.
+epithelium <- subset(epithelium, subset = orig.ident == "G-SCI7T094-SCI5T094", invert = TRUE)
+
+# Remove remaining contams
+epithelium <- subset(epithelium, idents = c("Colonocyte_Enterocyte"),
+                                            invert=TRUE)
+
+annotation_colors_epithelium <- OCMSutility::get_palette(n = 50)[1:7]
+#annotation_colors_epithelium <- annotation_colors_epithelium[c(2, 1, 3:20)]
+
+names(annotation_colors_epithelium) <- levels(Idents(epithelium))
+
+# save the colors
+saveRDS(annotation_colors_epithelium, file="export.dir/Clustering/epithelium_cell_colors_caecum.Rds")
+
+dimplot_epi <- DimPlot(epithelium, label = TRUE, repel = TRUE) + 
+  scale_color_manual(values = annotation_colors_epithelium) +
+  ggtitle(paste0("No. cells = ", nrow(epithelium@meta.data)))
+
+dimplot_epi
+
+# write out epithelial annotated clusters
+
+# Figure 1D
+ggsave(dimplot_epi + theme(legend.position = "none"), file = "export.dir/Figures/Epithelium_umap_caecum.pdf", height=5, width=5)
+
+saveRDS(epithelium, file = "export.dir/Clustering/caecum_epithelium_clusters_annotated.Rds")
+
+```
+
+
+### Profile of epithelium subsets across individuals
+
+This is just to show the profiles of these cell types across individuals.
+
+```{epithelial proportions, echo=FALSE, message=FALSE}
+
+
+ind_props_epi <- plot_props(epithelium, metadata, annotation_colors_epithelium) +
+  theme(axis.text.x = element_blank()) +
+  theme(axis.text.x = element_blank(), legend.position = "bottom")
+
+ggsave(ind_props_epi, file = "export.dir/Figures/epithelial_cells_profile_caecum.pdf", height=3, width = 6)
+
+ind_props_epi
+
+```
+
+## Number of cells per cell type
+
+```{r epithelium ncells, echo = FALSE, message=FALSE}
+
+epithelium <- readRDS("export.dir/Clustering/caecum_epithelium_clusters_annotated.Rds")
+
+epithelium@meta.data$annotation <- Idents(epithelium)
+
+ncells_per_sample_epithelium <- as.data.frame(table(epithelium@meta.data$annotation,
+                                                epithelium@meta.data$orig.ident))
+knitr::kable(ncells_per_sample_epithelium)
+
+# only analyse when there are at least 20 cells per indivudual
+ncells_per_sample_epithelium$disease_type <- metadata[as.character(ncells_per_sample_epithelium$Var2), ]$disease_type
+ggplot(ncells_per_sample_epithelium, aes(x=disease_type, y=Freq, color=disease_type)) +
+  geom_point() +
+  theme_classic() +
+  facet_wrap(~Var1, scales = "free") +
+  geom_hline(yintercept = 20,  linetype="dashed") +
+  theme(axis.text.x = element_blank()) +
+  scale_color_manual(values = group_colors) +
+ # ggpubr::stat_compare_means(comparisons = list(c(1,2), c(1,3), c(2,3))) +
+  ggrepel::geom_text_repel(label = ncells_per_sample_epithelium$Freq)
+
+```
+
+
+## Total proportion of each cell type
+
+```{r totals, echo=FALSE, message=FALSE}
+
+total <- nrow(epithelium@meta.data)
+
+enterocyte_prop <- (nrow(epithelium@meta.data[grep("Colonocyte", Idents(epithelium)),])/total)*100
+
+enterocyte_prop
+```
+
+
+### Testing for siginficant differences
+
+Here I use propeller to look for significant differences across disease states in terms of proportions of cell types.
+
+```{r significant differences, echo=FALSE, message=FALSE}
+
+# significant testing using propeller
+prop_list_epi <- getTransformedProps(clusters = Idents(epithelium),
+                                 sample = epithelium@meta.data$orig.ident)
+
+metadata_caecum <- metadata[metadata$tissue == "Caecum",]
+metadata_caecum <- metadata_caecum[colnames(prop_list_epi[[1]]),]
+
+design <- model.matrix(~0+disease_type, data = metadata_caecum)
+
+res_comp <- propeller.anova(prop_list_epi, design=design, coef=c(1,2,3), robust=TRUE,
+  trend=FALSE, sort=TRUE)
+
+knitr::kable(res_comp)
+```
+
+
+There are no signficant differences found between diseases.
+
+## Differences between Colonocyte subsets
+
+
+
+
+### Marker expression across cells
+
+The DUOX2 colonocytes are odd ones. Ignore those for now
+
+```{r featureplots markers, echo=FALSE, message=FALSE}
+
+colonocytes <- subset(epithelium, idents = c("Colonocyte_AQP8", "Colonocyte"))
+
+colonocytes <- ScaleData(colonocytes)
+colonocytes <- RunPCA(colonocytes)
+```
+
+### Dimplot of colonocytes alone
+
+```{r colonocyte dimplot, echo=FALSE, message=FALSE}
+
+dplot_colonocytes <- DimPlot(colonocytes, reduction = "pca", label=TRUE) +
+  scale_color_manual(values = annotation_colors_epithelium) +
+  theme(legend.position = "none")
+
+dplot_colonocytes
+
+ggsave(dplot_enterocytes, file="export.dir/Figures/Dimplot_colonocytes_caecum.pdf", height=5, width=5)
+
+```
+
+
+### Differences between the major colonocyte subsets
+
+Do they represent different cell "types" or cell "states"?
+
+```{r diff in enterocytes, echo=FALSE, message=FALSE}
+
+colonocyte_diffs <- FindMarkers(colonocytes, ident.2="Colonocyte_AQP8",
+                                ident.1 = "Colonocyte")
+
+# Annotate the results
+colonocyte_diffs$sig <- ifelse(colonocyte_diffs$p_val_adj < 0.05 &
+                              colonocyte_diffs$avg_log2FC > 1, 
+                              "Colonocyte", 
+                               NA)
+
+colonocyte_diffs$sig <- ifelse(colonocyte_diffs$p_val_adj < 0.05 &
+                              colonocyte_diffs$avg_log2FC < 1, 
+                               "AQP8", 
+                               colonocyte_diffs$sig)
+
+colonocyte_diffs$label <- ifelse(rownames(colonocyte_diffs) %in% 
+                                   c("Colonocyte", "AQP8"),
+                                 rownames(colonocyte_diffs), NA) 
+
+ggplot(colonocyte_diffs, aes(x=avg_log2FC, y = -log10(p_val_adj), color=sig)) +
+  geom_point(alpha=0.5, size=0.5) +
+  theme_classic() +
+  scale_color_manual(values = c(annotation_colors_epithelium[[1]],
+                                annotation_colors_epithelium[[2]])) +
+  geom_vline(xintercept = c(-1, 1), linetype="dashed") +
+  geom_vline(xintercept = 0) +
+  ggrepel::geom_text_repel(label = colonocyte_diffs$label)
+
+```
+
+
+```{r plotting features, echo=FALSE, message=FALSE}
+
+faqp8 <- feature_plot(colonocytes, feature = "AQP8", high=annotation_colors_epithelium[[2]]) 
+  
+faqp8
+
+```
+
+
+
+## Differential expression - pseudobulk
+
+Here we perform differential expression analysis on pseudobulk expression across cells in cell types that have enough cells (typically >20/individual).
+
+### Colonocytes
+
+
+```{r pseudobulk colonocytes, echo=FALSE, message=FALSE}
+
+# table the number of cells per invididual
+colonocytes <- subset(epithelium, idents = c("Colonocyte", "Colonocyte_AQP8"))
+colonocytes@meta.data$annotation <- as.character(Idents(colonocytes))
+Idents(colonocytes) <- colonocytes@meta.data$orig.ident
+ncells_colono <- as.data.frame(table(Idents(colonocytes)))
+knitr::kable(ncells_colono)
+
+# remove troublesome samples
+colonocytes <- subset(colonocytes, idents = c("G-SCI7T022-SCI5T022"), invert=TRUE)
+
+Idents(colonocytes) <- colonocytes@meta.data$annotation
+
+# Write out the colonocytes object so we can compare
+# with ileal enterocytes
+saveRDS(colonocytes, file = "export.dir/caecum_colonocytes.Rds")
+
+# aggregate for pseudobulk analysis
+agg_all <- AggregateExpression(colonocytes,
+                               group.by = c("orig.ident"))                                                             
+
+agg_all <- as.data.frame(agg_all)
+colnames(agg_all) <- gsub("RNA\\.", "", colnames(agg_all))
+rownames(metadata) <- gsub("-", "\\.", rownames(metadata))
+coldata <- metadata[colnames(agg_all),]
+dds <- DESeqDataSetFromMatrix(agg_all, colData = coldata, design=~disease_type)
+dds$disease_type <- relevel(dds$disease_type, ref = "HC")
+dds <- dds[rowSums(counts(dds) >= 10) >= 3,]
+dds <- DESeq2::DESeq(dds)
+
+# get results for each contrast
+# get results for each contrast
+# lfc shrink
+res1 <- lfcShrink(dds,
+                  contrast = c("disease_type", "PSCUC", "HC"),
+                  res = results(dds, name = "disease_type_PSCUC_vs_HC"),
+                  type = "normal")
+
+res2 <- lfcShrink(dds,
+                  contrast = c("disease_type", "UC", "HC"),
+                  res = results(dds, name = "disease_type_UC_vs_HC"),
+                  type = "normal")
+
+```
+
+#### Volcano plot
+
+```{psc enterocytes volcano, echo=FALSE, message=FALSE}
+
+#res1_toplot <- res1
+#res1$log2FoldChange[res1$log2FoldChange < -5] <- -5
+
+psc_colonocyte_volc <- volcano_plot(res1, use="padj") +
+  ggtitle("PSC-UC vs. Healthy") +
+  scale_color_manual(values = "blue3") +
+  theme(legend.position = "none")
+
+psc_colonocyte_volc
+
+# Figure
+ggsave(psc_colonocyte_volc, file = "export.dir/Figures/colonocyte_caecum_psc_volcano.pdf", height = 3, width=3)
+
+uc_colonocyte_volc <- volcano_plot(res2, use="padj") +
+  ggtitle("UC vs. Healthy") +
+  scale_color_manual(values = "blue3") +
+  theme(legend.position = "none")
+
+ggsave(uc_colonocyte_volc, file = "export.dir/Figures/colonocyte_caecum_uc_volcano.pdf", height = 5, width=5)
+
+uc_colonocyte_volc
+
+# save the results to compare with ileal enterocytes
+write.table(data.frame(gene = rownames(res1), as.data.frame(res1)),
+            file = "export.dir/caecum_colonocytes_pscuc_vs_healthy.tsv",
+            sep = "\t",
+            quote = FALSE,
+            row.names = FALSE)
+
+
+
+
+```
+
+```{r table of differences enterocytes, echo=FALSE, message=FALSE}
+
+nup_psc <- nrow(res1[res1$padj < 0.05 & res1$log2FoldChange > 0 & !(is.na(res1$padj)),])
+nup_uc <- nrow(res2[res2$padj < 0.05 & res2$log2FoldChange > 0 & !(is.na(res2$padj)),])
+ndown_psc <- nrow(res1[res1$padj < 0.05 & res1$log2FoldChange < 0 & !(is.na(res1$padj)),])
+ndown_uc <- nrow(res2[res2$padj < 0.05 & res2$log2FoldChange < 0 & !(is.na(res2$padj)),])
+
+results_ent <- data.frame(comparison = resultsNames(dds)[2:3],
+                          no.up = c(nup_psc, nup_uc),
+                          no.down = c(ndown_psc, ndown_uc))
+
+knitr::kable(results_ent)
+```
+
+## Gene set enrichment analysis
+
+
+```{r colonocyte fgsea, echo=FALSE, message=FALSE}
+
+set.seed(10)
+
+colonocyte_genes <- res1$log2FoldChange
+names(colonocyte_genes) <- rownames(res1)
+
+# gene set enrichments
+colonocyte_fgsea <- fgsea::fgsea(pathways, colonocyte_genes, minSize=50)
+colonocyte_fgsea <- colonocyte_fgsea[order(colonocyte_fgsea$padj, decreasing = FALSE),]
+
+colonocyte_pathways_sig <- colonocyte_fgsea[colonocyte_fgsea$padj < 0.05,]
+
+colonocyte_top10 <- colonocyte_pathways_sig[1:10,]
+colonocyte_top10$pathway <- factor(colonocyte_top10$pathway, levels = colonocyte_top10$pathway)
+colonocyte_top10_p <- ggplot(colonocyte_top10, aes(x = pathway, y=NES, fill=-log10(padj))) +
+  geom_bar(stat="identity") +
+  scale_fill_gradient(low="snow2", high=immune_cell_anno_colors[[2]]) +
+  theme_classic() +
+  coord_flip()
+  
+ggsave(colonocyte_top10_p, file = "export.dir/Figures/colonocyte_pathway_barplot_caecum.pdf", height=2.5, width=10)
+
+colonocyte_top10_p
+
+```
+
+## Leading edge heatmap
+
+```{r protein metabolism heat, echo=FALSE, message=FALSE}
+
+vst_all <- as.data.frame(assay(vst(dds)))
+
+peptide_le <- unlist(colonocyte_fgsea[colonocyte_fgsea$pathway == "GO_PEPTIDE_METABOLIC_PROCESS",]$leadingEdge)
+
+# Heatmap these genes in different T-cells
+vst_colonocyte_peptide <- ScaleData(vst_all[peptide_le,])
+
+# sort out annotations for the disease states
+disease_anno <- HeatmapAnnotation("Disease type" = coldata$disease_type,
+                                  col = list("Disease type" = c("HC" = "grey",
+                                                                "PSCUC" = blues9[6],
+                                                                "UC" = "red3")))
+
+heat_colors <- colorRamp2(breaks = c(-2,0,2), colors = c("blue3", "white", "red3"))
+h1 <- Heatmap(vst_colonocyte_peptide,
+              column_split = coldata$disease_type,
+              col = heat_colors,
+              cluster_columns = FALSE,
+              top_annotation = disease_anno,
+              show_column_names = FALSE,
+              rect_gp = gpar(col="white", lwd=0.5),
+              row_names_gp = gpar(fontsize=4))
+
+h1
+
+```
+
+
+
+

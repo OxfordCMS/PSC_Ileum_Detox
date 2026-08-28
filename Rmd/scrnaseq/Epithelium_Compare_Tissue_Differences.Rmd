@@ -1,0 +1,317 @@
+---
+title: "Enterocytes/colonocytes Cells Compare Differences"
+output: html_document
+date: "2026-02-17"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir="/well/powrie/users/utu691/work/proj072/analysis/final_analysis")
+```
+
+```{r load libraries, echo = FALSE, message = FALSE}
+
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+source("~/devel/proj060/code/R/gex_helper.R")
+source("~/devel/proj072/R/scfunctions.R")
+library(RColorBrewer)
+library(fgsea)
+library(futile.logger)
+library(harmony)
+library(speckle)
+library(scWGCNA)
+library(circlize)
+library(ggraph)
+library(igraph)
+library(DESeq2)
+library(OCMSutility)
+
+```
+
+# Overview
+
+We have seen some interesting results particularly in the ileum. We also ahve data from the caecum and so we need to compare what we see across the two tissues. Given the tissue-specific functions of mature absorptive epithelial cells in these two tissues it is unlikely that the same features are observed but here we characterise specific pathways to see if we can say something about GSTA1-associated genes etc.
+
+## Comparing cell types
+
+```{r compare cell types, echo = FALSE, message = FALSE}
+
+ileum_entero <- readRDS("export.dir/ileum_enterocytes.Rds")
+Idents(ileum_entero) <- "Ileum"
+caecum_colono <- readRDS("export.dir/caecum_colonocytes.Rds")
+Idents(caecum_colono) <- "Caecum"
+
+all_colono_entero <- merge(ileum_entero, caecum_colono)
+
+# recluster etc
+all_colono_entero <- ScaleData(all_colono_entero,
+                               features = rownames(all_colono_entero))
+
+all_colono_entero <- FindVariableFeatures(all_colono_entero,
+                                          selection.method = "vst",
+                                          nfeatures = 2000)
+
+all_colono_entero <- RunPCA(all_colono_entero,
+                            features = VariableFeatures(object = all_colono_entero))
+
+# harmony integration: by individual = orig.ident
+all_colono_entero <- all_colono_entero %>% 
+RunHarmony("orig.ident", plot_convergence = TRUE)
+all_colono_entero<- FindNeighbors(all_colono_entero,
+                                  reduction="harmony",
+                                  dims = 1:30)
+all_colono_entero <- RunUMAP(all_colono_entero,
+                             dims = 1:30,
+                             reduction = "harmony")
+
+tissue_colors <- c(c(blues9[4], blues9[8]))
+names(tissue_colors) <- c("Ileum", "Caecum")
+
+dplot_compare <- DimPlot(all_colono_entero, reduction = "pca") +
+  scale_color_manual(values = tissue_colors) 
+  
+dplot_compare
+
+ggsave(dplot_compare + theme(legend.position = "none"),
+       file = "export.dir/Comparison/epithelium_tissue_compare_pca.pdf",
+       height = 5, width = 5)
+
+
+```
+
+
+
+## GSTA1 and APOA1 genes
+
+This shows the differences in expression of GSTA1-associated genes - we assess whether these are tissue-sepcific genes in some respects.
+
+```{r tissue specific genes, echo = FALSE, message = FALSE}
+
+agg_ents <- as.data.frame(AggregateExpression(all_colono_entero, group.by = "orig.ident"))
+
+colnames(agg_ents) <- gsub("RNA\\.", "", colnames(agg_ents))
+
+all_colono_entero$tissue <- Idents(all_colono_entero)
+
+agg_meta <- distinct(data.frame(sample = all_colono_entero@meta.data$orig.ident,
+                                tissue = all_colono_entero@meta.data$tissue,
+                                disease_type = all_colono_entero@meta.data$disease_type))
+
+
+rownames(agg_meta) <- gsub("-", "\\.", agg_meta$sample)
+agg_meta <- agg_meta[colnames(agg_ents),]
+
+## DESeq analysis between tissues
+agg_meta <- agg_meta[colnames(agg_ents),]
+dds_agg <- DESeqDataSetFromMatrix(agg_ents,
+                                  colData = agg_meta,
+                                  design = ~tissue)
+dds_agg <- DESeq(dds_agg)
+agg_res <- lfcShrink(dds_agg,
+                     contrast = c("tissue", "Ileum", "Caecum"),
+                     res = results(dds_agg),
+                     type = "normal")
+
+gsta1_genes <- readRDS("export.dir/gsta1_cluster.Rds")
+gsta1_genes <- rownames(gsta1_genes[gsta1_genes$Membership > 0.6, ])
+
+apoa1_genes <- readRDS("export.dir/apoa1_cluster.Rds")
+apoa1_genes <- rownames(apoa1_genes[apoa1_genes$Membership > 0.6, ])
+
+
+agg_vst <- as.data.frame(vst(as.matrix(agg_ents)))
+
+agg_res <- as.data.frame(agg_res)
+agg_res <- agg_res[order(agg_res$padj, decreasing = FALSE),]
+
+sig_up_ileum <- rownames(agg_res[agg_res$padj < 0.05 & agg_res$log2FoldChange > 1,])
+
+
+# change volcano plot function
+volcano_plot_2 <- function(x, use="padj", value=0.05, labels = NULL){
+  
+  if (is.null(labels)){
+    x$label <- ifelse(x[,use] < value &!(is.na(x[,use])), rownames(x), NA)
+  }else{
+    x$label <- ifelse(rownames(x) %in% labels, rownames(x), NA)
+  }
+  
+  x$color <- ifelse(x[,use] < value &!(is.na(x[,use])) & x$log2FoldChange > 1, "Ileum", NA)
+  x$color <- ifelse(x[,use] < value &!(is.na(x[,use])) & x$log2FoldChange < -1, "Caecum", x$color)
+  ggplot(x, aes(x=log2FoldChange, y = -log10(pvalue), color=color)) +
+    geom_point(size = 1, alpha = 0.5) +
+    geom_vline(xintercept=c(-1,1), linetype = "dashed") +
+    ggrepel::geom_text_repel(label = x$label, max.overlaps=20, color = "black") +
+    theme_classic() +
+    scale_color_manual(values = c(tissue_colors)) 
+}
+
+
+
+gsta1_genes_sig <- gsta1_genes[gsta1_genes %in% sig_up_ileum]
+apoa1_genes_sig <- apoa1_genes[apoa1_genes %in% sig_up_ileum]
+
+vplot <- volcano_plot_2(agg_res, labels = gsta1_genes_sig) +
+  theme(legend.position = "none")
+
+ggsave(vplot, file = "export.dir/Comparison/epithelium_volcano_caecum_ileum.pdf", height = 5, width = 5)
+
+vplot
+
+featurebox(agg_vst, agg_meta, features = gsta1_genes_sig, group_by = "tissue") +
+  theme_classic() +
+  scale_color_manual(values = tissue_colors) +
+  facet_wrap(~feature, scales = "free") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggpubr::stat_compare_means(comparisons = list(c(1,2)), size = 2)
+
+featurebox(agg_vst, agg_meta, features = apoa1_genes_sig, group_by = "tissue") +
+  theme_classic() +
+  scale_color_manual(values = tissue_colors) +
+  facet_wrap(~feature, scales = "free") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggpubr::stat_compare_means(comparisons = list(c(1,2)), size = 2)
+```
+
+
+Basically I think this is quite revealing and shows that `r length(gsta1_genes_sig)/length(gsta1_genes)` GSTA1-associated genes and `r length(apoa1_genes_sig)/length(apoa1_genes)` APOA1-associated genes are more highly expressed in the ileum than the caecum. This suggests that differences seen in PSC-UC in GSTA1-associated genes in the ileum are indeed to do with more ileum-associated functions i.e. detoxification in ileal enterocytes.
+
+
+## Feature plots of GSTA1 and associated genes
+
+I might include these in a figure.
+
+
+```{r features, echo = FALSE, message = FALSE}
+
+gsta1_featureplots <- FeaturePlot(all_colono_entero, features = gsta1_genes_sig, reduction = "pca") 
+ggsave(file = "export.dir/Comparison/gsta1_across_tissues.pdf", width = 10, height = 15)
+
+```
+
+
+## Adonis test
+
+Here I just want to see if there is a statistical association with tissue site ie. so cells cluster by tissue. The adonis test can do this for me.
+
+```{r adonis test, echo = FALSE, message = FALSE}
+
+vegan::adonis2(t(agg_ents) ~ tissue, method = "euclidean", data = agg_meta)
+
+
+```
+
+
+
+## Metagene signatures
+
+To summarise the differences we can look at a metagene signature i.e. just a mean across all genes for each sample. This will enable a more reduced plotting landscape.
+
+```{r metagenes, echo = FALSE, message = FALSE, warning = FALSE}
+
+metagene_gsta1 <- agg_vst[gsta1_genes,]
+metagene_gsta1 <- colMeans(metagene_gsta1)
+
+metagene_apoa1 <- agg_vst[apoa1_genes,]
+metagene_apoa1 <- na.omit(metagene_apoa1)
+metagene_apoa1 <- colMeans(metagene_apoa1)
+
+both_metagenes <- as.data.frame(t(dplyr::bind_cols(as.data.frame(metagene_gsta1),
+                                   as.data.frame(metagene_apoa1))))
+
+
+featurebox(agg_vst, agg_meta, features = c("ADIRF"), group_by = "disease_type") +
+  theme_classic() +
+  scale_color_manual(values = tissue_colors) +
+  facet_wrap(~feature, scales = "free") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggpubr::stat_compare_means(comparisons = list(c(1,2)), size = 2) 
+
+
+```
+
+For sure these are more ileum functions.
+
+
+## Comparison differential expression results
+
+There is only one gene, ADIRF, which is signficantly lower in expression in PSC-UC in the caecum in colonocytes. Below we also plot this in the ileum enterocytes to see if it is at least similarly down-regulated.
+
+
+### ADIRF
+
+```{r adirf expression, echo = FALSE, message = FALSE}
+
+# add ADIRF to agg_meta
+agg_meta$ADIRF <- unlist(agg_vst["ADIRF",rownames(agg_meta)])
+ggplot(agg_meta, aes(x = disease_type, y = ADIRF, color = disease_type)) +
+  geom_boxplot(outlier.alpha = 0) +
+  geom_jitter(height = 0, width = 0.1) +
+  theme_classic() +
+  facet_wrap(~tissue) +
+  scale_color_manual(values = unlist(group_colors)) +
+  theme(legend.position = "none")
+ggsave("export.dir/ADIRF.pdf", height = 2.5, width = 4)
+
+
+```
+
+
+
+```{r comparison, echo = FALSE, message = FALSE}
+
+pathways <- gmtPathways("~/mirror/msigdb/msigdb_v7.1/msigdb_v7.1_GMTs/c5.bp.v7.1.symbols.gmt")
+
+
+ileum_res <- read.csv("export.dir/ileum_enterocytes_pscuc_vs_healthy.tsv",
+                      header = TRUE,
+                      stringsAsFactors = FALSE,
+                      sep = "\t",
+                      row.names = 1)
+
+caecum_res <- read.csv("export.dir/caecum_colonocytes_pscuc_vs_healthy.tsv",
+                      header = TRUE,
+                      stringsAsFactors = FALSE,
+                      sep = "\t",
+                      row.names = 1)
+
+subset(caecum_res, subset = padj < 0.05)
+
+# merge the results tables
+ileum_fold <- data.frame(gene = rownames(ileum_res),
+                         fold = ileum_res$log2FoldChange)
+
+caecum_fold <- data.frame(gene = rownames(caecum_res),
+                         fold = caecum_res$log2FoldChange)
+
+merged_ents <- merge(ileum_fold,
+                     caecum_fold,
+                     by.x = "gene",
+                     by.y = "gene",
+                     all.x = TRUE,
+                     all.y = TRUE)
+merged_ents[is.na(merged_ents)] <- 0
+colnames(merged_ents) <- c("gene", "Ileum", "Caecum")
+
+merged_ents$label <- ifelse(merged_ents$gene %in% gsta1_genes_sig, merged_ents$gene, NA)
+merged_ents$GSTA1 <- ifelse(merged_ents$gene %in% gsta1_genes_sig, "GSTA1", NA)
+
+
+colors <- readRDS("export.dir/Clustering/epithelium_cell_colors.Rds")
+
+ggplot(merged_ents, aes(x = Ileum, y = Caecum, color = GSTA1)) +
+  geom_point(size = 0.3) +
+  theme_classic() +
+  geom_hline(yintercept = c(-0.5,0.5, 0), linetype = "dashed") +
+  geom_vline(xintercept = c(-0.5,0.5, 0), linetype = "dashed") +
+  ylim(c(-3,3)) +
+  ggrepel::geom_text_repel(label = merged_ents$label) +
+  stat_smooth(method = "lm") +
+  scale_color_manual(values = c(colors[[1]]))
+
+
+```

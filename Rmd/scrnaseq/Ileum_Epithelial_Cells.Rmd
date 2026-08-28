@@ -1,0 +1,1021 @@
+---
+title: "Ileum epithelial analysis: Forced cells 10000"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo=FALSE}
+
+
+# temporary solution to libpaths
+.libPaths("~/R/x86_64-pc-linux-gnu-library/4.3/")
+
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(dev.args=list(png=list(type="cairo")))
+options(bitmapType = "cairo")
+knitr::opts_knit$set(root.dir="/well/powrie/users/utu691/work/proj072/analysis/final_analysis")
+
+
+# reticulate stuff
+reticulate::use_virtualenv('~/devel/venv/Python-3.10.8-GCCcore-12.2.0/skylake/', required=TRUE)
+```
+
+```{r load libraries, echo=FALSE, message=FALSE}
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+source("~/devel/proj060/code/R/gex_helper.R")
+source("~/devel/proj072/R/scfunctions.R")
+library(RColorBrewer)
+library(fgsea)
+library(futile.logger)
+library(harmony)
+library(speckle)
+library(scWGCNA)
+library(circlize)
+library(ggraph)
+library(igraph)
+library(DESeq2)
+library(viridis)
+
+# create Clustering analysis dir
+if (!(dir.exists("export.dir/Epithelium"))){
+  dir.create("export.dir/Epithelium")
+}
+```
+
+
+```{r set colors, echo=FALSE, message=FALSE, warning=FALSE}
+
+group_colors <- list("UC" = "red3", "PSCUC" = blues9[6], "HC" = "grey")
+
+```
+
+# Overview
+
+We will need to organise data analysis by cell types. There are some that will not have enough cells to perform pseudobulk for example but we can determine this as we go along. In this doc I am going to look at the epithelial compartment. Part of the analysis will be to understand a bit more about genes that we saw in bulk RNA-seq so am very interested in glutathione metabolism and oxidative stress responses.
+
+```{r read data merged ileum, echo=FALSE, message=FALSE}
+
+merged_ileum <- readRDS("export.dir/Clustering/ileum_harmonised_force_cells_annotated.Rds")
+
+# read in metadata
+metadata <- read.csv("/well/powrie/projects/proj072/analysis/GEX/05_cellranger_pipeline/samples.tsv",
+                     header=TRUE,
+                     stringsAsFactors = FALSE,
+                     sep="\t",
+                     row.names=2)
+```
+
+```{r subset for epithelial cells, echo=FALSE, message=FALSE}
+
+epithelium <- subset(merged_ileum, idents = c("Enterocyte",
+                                              "Enterocyte_2",
+                                              "Enterocyte_3",
+                                              "Epithelial_Stem",
+                                              "Tuft_Cell",
+                                              "Goblet_Cell",
+                                              "Paneth_Cell",
+                                              "Enterocyte_BEST4_OTOP2"))
+
+
+```
+
+## Re-clustering of epithelial cells {.tabset .tabset-pills}
+
+Here we recluster just the epithelial cells.
+
+```{r recluster epithelium, echo=FALSE, message=FALSE}
+
+set.seed(10)
+
+# recluster etc
+epithelium <- ScaleData(epithelium, features = rownames(epithelium))
+epithelium <- FindVariableFeatures(epithelium, selection.method = "vst", nfeatures = 2000)
+epithelium <- RunPCA(epithelium, features = VariableFeatures(object = epithelium))
+
+# harmony integration: by individual = orig.ident
+epithelium <- epithelium %>% 
+RunHarmony("orig.ident", plot_convergence = TRUE)
+epithelium <- FindNeighbors(epithelium, reduction="harmony", dims = 1:30)
+epithelium <- FindClusters(epithelium, resolution = 0.5, algorithm = 4)
+epithelium <- RunUMAP(epithelium, dims = 1:30, reduction = "harmony")
+```
+
+### UMAP
+
+```{r epitheilum umap, echo=FALSE, message=FALSE}
+
+DimPlot(epithelium, label=TRUE, reduction = "umap")
+
+```
+
+### Dotplot of markers
+
+```{r dotplot epithelium, echo=FALSE, message=FALSE, width = 11}
+
+# find markers for exploration
+epithelium <- JoinLayers(epithelium)
+epi_markers <- FindAllMarkers(epithelium, only.pos = TRUE)
+
+epithelial_cell_genes <- c("VIL1",  
+                          "FABP6",
+                          "FABP1",
+                          "KRT19",
+                          "KRT8",
+                          "APOA1",
+                          "APOB",
+                          "DEFA5",
+                          "DEFA6",
+                          "REG3A",
+                          "SLC10A2",
+                          "GSTA2",
+                          "GSTA1",
+                          "DUOX2",
+                          "DUOXA2",
+                          "TPT1",
+                          "LGR5",
+                          "OLFM4",
+                          "RGMB",
+                          "SMOC2",
+                          "ASCL2",
+                          "MKI67",
+                          "PCNA",
+                          "TOP2A",
+                          "CCNA2",
+                          "POU2F3",
+                          "GFI1B",
+                          "TRPM5",
+                          "DCLK1",
+                          "CLCA1",
+                          "MUC5AC",
+                          "SPINK4",
+                          "TFF3",
+                          "AGR2",
+                          "SPARC",
+                          "CPE",
+                          "NEUROD1",
+                          "BEST4",
+                          "OTOP2")
+
+dplot_epi <- DotPlot(epithelium,
+             cols = colorRampPalette(c("blue", "red"))(2),
+             features=c(epithelial_cell_genes),
+             cluster.idents = TRUE) +
+             theme(axis.text.x = element_text(angle=45, hjust=1)) 
+
+dplot_epi
+
+```
+
+## Score cell cycle
+
+```{r cell cycle, echo=FALSE, message=FALSE}
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+epithelium <- CellCycleScoring(epithelium, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+
+DimPlot(epithelium, label=TRUE, split.by="disease_type")
+Idents(epithelium) <- epithelium@meta.data$seurat_clusters
+```
+
+Proliferating cells will be the TA so will not regress out actually.
+
+
+## Annotation
+
+The main thing here is to pick out the most relevant populations. If there are some that seem sketchy then they will be removed and we will only keep those that have robust markers associated with them. There are no really good markers that distinguish cluster 3.
+
+```{r annotation epithelium, echo=FALSE, message=FALSE}
+
+# annotations
+annotations_epi <- c("Enterocyte_GSTA1",
+                     "Enterocyte_APOA1",
+                     "Epithelium_OLFM4",
+                     "Enterocyte_APOA1",
+                     "Enterocyte_Mt",
+                     "Epithelium_Flagged_CD45",
+                     "Undetermined",
+                     "Enterocyte_GSTA1",
+                     "Tuft_Cell",
+                     "Enterocyte_Flagged_Ig",
+                     "Goblet_Cell",
+                     "Enterocyte_BEST4_OTOP2",
+                     "Undetermined",
+                     "Undetermined",
+                     "Paneth_Cell",
+                     "Enteroendocrine")
+
+names(annotations_epi) <- levels(epithelium)
+epithelium <- RenameIdents(epithelium, annotations_epi)
+
+
+# remove contamination clusters
+epithelium <- subset(epithelium, idents = c("Epithelium_Flagged_CD45",
+                                            "Enterocyte_Flagged_Ig",
+                                            "Enterocyte_Mt",
+                                            "Undetermined"),
+                                            invert=TRUE)
+
+
+annotation_colors_epithelium <- OCMSutility::get_palette(n = 50)[10:20]
+annotation_colors_epithelium <- annotation_colors_epithelium[c(2, 1, 3:20)]
+
+names(annotation_colors_epithelium) <- levels(Idents(epithelium))
+
+# save the colors
+saveRDS(annotation_colors_epithelium, file="export.dir/Clustering/epithelium_cell_colors.Rds")
+
+dimplot_epi <- DimPlot(epithelium, label = TRUE, repel = TRUE) + 
+  scale_color_manual(values = annotation_colors_epithelium) +
+  ggtitle(paste0("No. cells = ", nrow(epithelium@meta.data)))
+
+dimplot_epi
+
+# For Figure 1
+ggsave(dimplot_epi + theme(legend.position = "none"), file = "export.dir/Figures/Epithelium_umap.pdf", height=5, width=5)
+
+# write out epithelial annotated clusters
+
+saveRDS(epithelium, file = "export.dir/Epithelium/ileum_epithelium_clusters_annotated.Rds")
+
+
+dplot_epi <- DotPlot(epithelium,
+             cols = colorRampPalette(c("blue", "red"))(2),
+             features=c(epithelial_cell_genes),
+             cluster.idents = TRUE) +
+             theme(axis.text.x = element_text(angle=45, hjust=1)) 
+
+dplot_epi
+
+ggsave(file = "export.dir/Epithelium/epithelium_dotplot.pdf", height = 3, width = 15)
+
+```
+
+
+### Profile of epithelium subsets across individuals
+
+This is just to show the profiles of these cell types across individuals.
+
+```{epithelial proportions, echo=FALSE, message=FALSE}
+
+epithelium <- readRDS("export.dir/Epithelium/ileum_epithelium_clusters_annotated.Rds")
+annotation_colors_epithelium <- readRDS("export.dir/Clustering/epithelium_cell_colors.Rds")
+
+ind_props_epi <- plot_props(epithelium, metadata, annotation_colors_epithelium) +
+  theme(axis.text.x = element_blank()) +
+  theme(axis.text.x = element_blank(), legend.position = "bottom")
+
+ggsave(ind_props_epi, file = "export.dir/Figures/epithelial_cells_profile.pdf", height=3, width = 6)
+
+ind_props_epi
+
+```
+
+## Number of cells per cell type
+
+```{r epithelium ncells, echo = FALSE, message=FALSE}
+
+
+epithelium@meta.data$annotation <- Idents(epithelium)
+
+ncells_per_sample_epithelium <- as.data.frame(table(epithelium@meta.data$annotation,
+                                                epithelium@meta.data$orig.ident))
+knitr::kable(ncells_per_sample_epithelium)
+
+# only analyse when there are at least 20 cells per indivudual
+ncells_per_sample_epithelium$disease_type <- metadata[as.character(ncells_per_sample_epithelium$Var2), ]$disease_type
+ggplot(ncells_per_sample_epithelium, aes(x=disease_type, y=Freq, color=disease_type)) +
+  geom_point() +
+  theme_classic() +
+  facet_wrap(~Var1, scales = "free") +
+  geom_hline(yintercept = 20,  linetype="dashed") +
+  theme(axis.text.x = element_blank()) +
+  scale_color_manual(values = group_colors) +
+ # ggpubr::stat_compare_means(comparisons = list(c(1,2), c(1,3), c(2,3))) +
+  ggrepel::geom_text_repel(label = ncells_per_sample_epithelium$Freq)
+
+```
+
+
+## Total proportion of each cell type
+
+```{r totals, echo=FALSE, message=FALSE}
+
+total <- nrow(epithelium@meta.data)
+
+enterocyte_prop <- (nrow(epithelium@meta.data[grep("Enterocyte", Idents(epithelium)),])/total)*100
+
+enterocyte_prop
+```
+
+
+### Testing for siginficant differences
+
+Here I use propeller to look for significant differences across disease states in terms of proportions of cell types.
+
+```{r significant differences, echo=FALSE, message=FALSE}
+
+# significant testing using propeller
+prop_list_epi <- getTransformedProps(clusters = Idents(epithelium),
+                                 sample = epithelium@meta.data$orig.ident)
+
+metadata_ileum <- metadata[metadata$tissue == "Ileum",]
+metadata_ileum <- metadata_ileum[colnames(prop_list_epi[[1]]),]
+
+design <- model.matrix(~0+disease_type, data = metadata_ileum)
+
+res_comp <- propeller.anova(prop_list_epi, design=design, coef=c(1,2,3), robust=TRUE,
+  trend=FALSE, sort=TRUE)
+
+knitr::kable(res_comp)
+```
+
+
+There are no signficant differences found between diseases.
+
+## Differences between enterocyte subsets
+
+I'm very interested in the APOA1 vs GSTA1 high enterocyte subsets because it looks a bit like they are the same cells in different states i.e. the GSTA1 high are potentially actively removing toxins etc. We did see these different clusters in our other dataset so I am interested in knowing how widespread it is i.e. in other datasets as well as whether there i evidence of transition from one state to another. This may also be important as I have a feeling about glutathione homeostasis being important in PSC.
+
+
+### Marker expression across cells
+
+Restricting to the APOA1 and GSTA1 enterocyte subsets.
+
+```{r featureplots markers, echo=FALSE, message=FALSE}
+
+enterocytes <- subset(epithelium, idents = c("Enterocyte_APOA1", "Enterocyte_GSTA1"))
+
+enterocytes <- ScaleData(enterocytes)
+enterocytes <- RunPCA(enterocytes)
+```
+
+### Dimplot of enterocytes alone
+
+```{r enterocyte dimplot, echo=FALSE, message=FALSE}
+
+dplot_enterocytes <- DimPlot(enterocytes, reduction = "pca", label=TRUE) +
+  scale_color_manual(values = annotation_colors_epithelium) +
+  theme(legend.position = "none")
+
+dplot_enterocytes
+
+ggsave(dplot_enterocytes, file="export.dir/Figures/Dimplot_enterocytes.pdf", height=5, width=5)
+
+```
+
+
+### Differences between the major enterocyte subsets
+
+I'm very interested in the GSTA1 hi enterocytes - ew can get a first handle on how different they are from APOA1 enterocytes by simply looking at differential gene expression between the groups. Do they represent different cell "types" or cell "states"?
+
+```{r diff in enterocytes, echo=FALSE, message=FALSE}
+
+enterocyte_diffs <- FindMarkers(enterocytes, ident.2="Enterocyte_APOA1",
+                                ident.1 = "Enterocyte_GSTA1")
+
+# Annotate the results
+enterocyte_diffs$sig <- ifelse(enterocyte_diffs$p_val_adj < 0.05 &
+                                 enterocyte_diffs$avg_log2FC > 1, 
+                               "GSTA1", 
+                               NA)
+
+enterocyte_diffs$sig <- ifelse(enterocyte_diffs$p_val_adj < 0.05 &
+                                 enterocyte_diffs$avg_log2FC < 1, 
+                               "APOA1", 
+                               enterocyte_diffs$sig)
+
+enterocyte_diffs$label <- ifelse(rownames(enterocyte_diffs) %in% 
+                                   c("GSTA1", "APOA1"),
+                                 rownames(enterocyte_diffs), NA) 
+
+ggplot(enterocyte_diffs, aes(x=avg_log2FC, y = -log10(p_val_adj), color=sig)) +
+  geom_point(alpha=0.5, size=0.5) +
+  theme_classic() +
+  scale_color_manual(values = c(annotation_colors_epithelium[[2]],
+                                annotation_colors_epithelium[[1]])) +
+  geom_vline(xintercept = c(-1, 1), linetype="dashed") +
+  geom_vline(xintercept = 0) +
+  ggrepel::geom_text_repel(label = enterocyte_diffs$label)
+
+```
+
+
+```{r plotting features, echo=FALSE, message=FALSE}
+
+fgsta1 <- feature_plot(enterocytes, feature = "GSTA1", high=annotation_colors_epithelium[[1]]) 
+  
+fapoa1 <- feature_plot(enterocytes, feature = "APOA1", high=annotation_colors_epithelium[[2]]) 
+
+gridExtra::grid.arrange(fgsta1, fapoa1, nrow=1)
+
+
+# Figure 2
+ggsave(fgsta1, file="export.dir/Figures/gsta1_featureplot.pdf", height=2, width=3)
+ggsave(fapoa1, file="export.dir/Figures/apoa1_featureplot.pdf", height=2, width=3)
+
+```
+
+
+
+### Public datasets
+
+To check that this isn't a quirk of our dataset I look at the paper that was published on healthy ileal epithelial cells (GSE125970).
+
+
+```{r public ileum data, echo=FALSE, message = FALSE}
+
+set.seed(10)
+
+public_data <- read.csv("~/work/proj039/analysis/GSE125970/GSE125970_raw_UMIcounts.txt",
+                        sep="\t",
+                        row.names=1)
+
+# create metadata from sample names
+tissue <- unlist(strsplit(colnames(public_data), "_"))
+tissue <- tissue[seq(2,length(tissue),3)]
+tissuex <- gsub("\\.[0-9]", "", tissue)
+
+#individual <- unlist(strsplit(colnames(public_data), "_"))
+#$individual <- individual[seq(2,length(cell.type),3)]
+#individual <- gsub("(.*\\.)", "", individual) 
+  
+cell.type <- unlist(strsplit(colnames(public_data), "_"))
+cell.type <- cell.type[seq(3,length(cell.type),3)]
+
+meta_pub <- data.frame(tissue=tissuex, cell.type=cell.type, donor = tissue)
+rownames(meta_pub) <- colnames(public_data)
+
+ileum_data <- public_data[,meta_pub$tissue == "Ileum"]
+meta_pub <- meta_pub[meta_pub$tissue == "Ileum",]
+meta_pub <- meta_pub[colnames(ileum_data),]
+
+# make seurat object
+public_sobj <- CreateSeuratObject(ileum_data, meta.data = meta_pub)
+public_sobj <- NormalizeData(public_sobj)
+
+Idents(public_sobj) <- public_sobj@meta.data$cell.type
+
+# jsut take enterocytes
+public_sobj <- subset(public_sobj, idents = "Enterocyte")
+
+# recluster etc
+public_sobj <- ScaleData(public_sobj, features = rownames(public_sobj))
+public_sobj <- FindVariableFeatures(public_sobj, selection.method = "vst", nfeatures = 2000)
+public_sobj <- RunPCA(public_sobj, features = VariableFeatures(object = public_sobj))
+
+public_sobj <- public_sobj %>% 
+RunHarmony("donor", plot_convergence = TRUE)
+
+public_sobj <- RunUMAP(public_sobj, dims = 1:30, reduction="harmony")
+DimPlot(public_sobj, reduction = "umap", label = TRUE) 
+  
+fgsta1_pub <- feature_plot(public_sobj, feature = "GSTA1", high=annotation_colors_epithelium[[1]]) 
+fapoa1_pub <- feature_plot(public_sobj, feature = "APOA1", high=annotation_colors_epithelium[[2]]) 
+
+gridExtra::grid.arrange(fgsta1_pub, fapoa1_pub, nrow=1)
+
+# Figure 2
+ggsave(fgsta1_pub, file="export.dir/Figures/gsta1_pub_featureplot.pdf", height=2, width=3)
+ggsave(fapoa1_pub, file="export.dir/Figures/apoa1_pub_featureplot.pdf", height=2, width=3)
+
+gridExtra::grid.arrange(fgsta1_pub, fapoa1_pub, nrow = 1)
+
+```
+
+## scWGCNA
+
+There aren't really many markers that separate the APOA1 cs GSTA1 - I want to see if there are co-expression patterns that might highlight any transcriptional networks that implicate control by TFs etc. Am doing this on the public dataset as they have more cells than we do.
+
+```{r scWGCNA, echo=FALSE, message=FALSE}
+
+if (!dir.exists("export.dir/scWGCNA")){
+  dir.create("export.dir/scWGCNA")
+}
+
+if (!file.exists("export.dir/scWGCNA/scwgcna_enterocytes.Rds")){
+
+  # have to convert the seurat object
+  scwgcna_epithelium <- public_sobj
+  scwgcna_epithelium[["RNA"]] <- as(object = scwgcna_epithelium[["RNA"]], Class = "Assay") 
+  scwgcna_epithelium <- ScaleData(scwgcna_epithelium)
+  scwgcna_epithelium <- FindVariableFeatures(scwgcna_epithelium)
+  scwgcna_epithelium <- RunPCA(scwgcna_epithelium)
+
+  scwgcna.pcells = calculate.pseudocells(s.cells = scwgcna_epithelium,
+                                          seeds=0.2,
+                                          nn = 10,
+                                          reduction = "pca",
+                                          dims = 1:10)
+
+  scwgcna <- run.scWGCNA(p.cells = scwgcna.pcells,
+              s.cells = scwgcna_epithelium,
+              is.pseudocell = F,
+              features = VariableFeatures(scwgcna_epithelium))
+
+  saveRDS(scwgcna, file = "export.dir/scWGCNA/scwgcna_enterocytes.Rds")
+}
+
+scwgcna <- readRDS("export.dir/scWGCNA/scwgcna_enterocytes.Rds")
+scwgcna_epithelium <- public_sobj
+scwgcna_epithelium[["RNA"]] <- as(object = scwgcna_epithelium[["RNA"]], Class = "Assay") 
+scwgcna_epithelium <- ScaleData(scwgcna_epithelium)
+scwgcna_epithelium <- FindVariableFeatures(scwgcna_epithelium)
+scwgcna_epithelium <- RunPCA(scwgcna_epithelium)
+
+# Plot the expression of all modules at once
+apoa1_metagene_p <- scW.p.expression(s.cells = scwgcna_epithelium,
+                             scWGCNA.data = scwgcna,
+                             modules = 1, 
+                             reduction = "pca", 
+                             ncol=3) +
+    ggplot2::scale_colour_gradientn(colours = c("gray90", 
+            "gray90", annotation_colors_epithelium[2], annotation_colors_epithelium[2])) +
+    ggtitle("APOA1 module [1]")
+
+gsta1_metagene_p <- scW.p.expression(s.cells = scwgcna_epithelium,
+                             scWGCNA.data = scwgcna,
+                             modules = 5, 
+                             reduction = "pca", 
+                             ncol=3)  +
+    ggplot2::scale_colour_gradientn(colours = c("gray90", 
+            "gray90", annotation_colors_epithelium[1], annotation_colors_epithelium[1])) +
+    ggtitle("GSTA1 module [5]")
+
+sc_modules <- scwgcna[["modules"]]
+apoa1_cluster <- sc_modules[[1]]
+gsta1_cluster <- sc_modules[[5]]
+
+saveRDS(apoa1_cluster, file = "export.dir/apoa1_cluster.Rds")
+saveRDS(gsta1_cluster, file = "export.dir/gsta1_cluster.Rds")
+
+gridExtra::grid.arrange(gsta1_metagene_p, apoa1_metagene_p, nrow=1)
+
+```
+
+
+## Plot the module eigengenes across cells
+
+Here we plot the heatmap of the MEs across cells. This should hopefully enable us to indicate which module contains GSTA1 and which one contains APOA1.
+
+```{r MES, echo=FALSE, message=FALSE}
+
+mes <- t(as.data.frame(scwgcna$MEs))
+
+# rename the modules to numbers
+rownames(mes) <- paste0("M", seq(1,6, 1))
+
+# Column annotation
+annotation <- ifelse(rownames(mes) == "M1", "Contains APOA1", NA)
+annotation <- ifelse(rownames(mes) == "M5", "Contains GSTA1", annotation)
+
+row_anno <- data.frame(annotation = annotation)
+row_anno <- rowAnnotation(annotation = row_anno$annotation,
+                          col = list(annotation = c("Contains APOA1" = annotation_colors_epithelium[[2]],
+                                                    "Contains GSTA1" = annotation_colors_epithelium[[1]])))
+
+cols <- viridis(n = 10)
+heat_colors <- colorRamp2(breaks = c(-0.04, 0, 0.04), colors = c(cols[1], cols[5], cols[10]))
+h_modules <- Heatmap(mes, show_column_names = FALSE,
+        use_raster = FALSE,
+        right_annotation = row_anno,
+        row_split = rownames(mes),
+        na_col = "white",
+        col=heat_colors)
+
+pdf("export.dir/Figures/heatmap_modules.pdf", width = 10, height = 4)
+h_modules
+dev.off()
+
+
+
+```
+
+## Metagene of modules 1 (APOA1) and 5 (GSTA1) in the datasets
+
+```{r metagene expression, echo=FALSE, message=FALSE}
+
+apoa1_genes <- rownames(apoa1_cluster[apoa1_cluster$Membership >= 0.60,])
+gsta1_genes <- rownames(gsta1_cluster[gsta1_cluster$Membership >= 0.60,])
+
+# write out genes in eah of these modules
+write.table(data.frame(gene = gsta1_genes),
+            file = "export.dir/scWGCNA/gsta1_genes.tsv",
+            row.names = FALSE,
+            quote=FALSE,
+            sep="\t")
+
+write.table(data.frame(gene = apoa1_genes),
+            file = "export.dir/scWGCNA/apoa1_genes.tsv",
+            row.names = FALSE,
+            quote=FALSE,
+            sep="\t")
+
+Idents(enterocytes) <- "Enterocyte"
+Idents(public_sobj) <- "Enterocyte"
+
+counts <- Seurat::GetAssayData(enterocytes, assay="RNA", layer="data")
+#counts_2 <- Seurat::GetAssayData(public_sobj, assay="RNA", layer="data")
+
+apoa1 <- intersect(rownames(counts), apoa1_genes)
+gsta1 <- intersect(rownames(counts), gsta1_genes)
+  
+colors <- colorRamp2(breaks = c(-4, 0, 4), colors = c("blue4", "white", "red4"))
+     
+#pub_counts <- ScaleData(as.data.frame(counts_2)[c(apoa1, gsta1),])
+our_counts <- ScaleData(as.data.frame(counts)[c(apoa1, gsta1),])
+         
+our_heat <- Heatmap(our_counts, show_column_names = FALSE, cluster_rows = FALSE,row_names_gp = gpar(fontsize=6), row_split = c(rep("APOA1", length(apoa1)), rep("GSTA1", length(gsta1))), clustering_distance_columns = "pearson", use_raster=FALSE, col = colors)
+
+#pub_heat <- Heatmap(pub_counts, show_column_names = FALSE, row_split = c(rep("APOA1", length(apoa1_genes)), rep("GSTA1", length(gsta1_genes))), clustering_distance_columns = "pearson", use_raster=FALSE, col=colors, cluster_rows = FALSE)
+
+our_heat
+
+```
+
+## Build correlated gene graphs
+
+Here I take the genes that are >0.6 module membership in those modules that contain GSTA1 and APOA1 to display the most highly correlated genes in these relevant modules.
+
+```{r graphs, echo=FALSE, message = FALSE}
+
+counts <- as.data.frame(our_counts)
+genes_apoa1 <- intersect(rownames(counts), apoa1_genes)
+apoa1_cor <- cor(t(counts[genes_apoa1,]))
+
+library(igraph)
+g1 <- igraph::graph_from_adjacency_matrix(apoa1_cor, weighted = TRUE, mode = "undirected", diag = FALSE)
+g1 <- delete.edges(g1, E(g1)[weight < 0 ])
+
+graph_apoa1 <- ggraph(g1, layout = "fr") +
+   geom_edge_link(color=annotation_colors_epithelium[2], aes(width=weight)) +
+   #geom_edge_arc(color="red4", aes(width=weight)) +
+   geom_node_point(size = 25, color="black") +
+   geom_node_text(aes(label = name), size=4, color="white") +
+   coord_fixed() +
+   theme_void()
+
+
+genes_gsta1 <- intersect(rownames(counts), gsta1_genes)
+gsta1_cor <- cor(t(counts[genes_gsta1,]))
+g2 <- igraph::graph_from_adjacency_matrix(gsta1_cor, weighted = TRUE, mode = "undirected", diag = FALSE)
+g2 <- delete.edges(g2, E(g2)[weight < 0 ])
+
+
+graph_gsta1 <- ggraph(g2, layout = "fr") +
+   geom_edge_link(color=annotation_colors_epithelium[1], aes(width=weight)) +
+   #geom_edge_arc(color="red4", aes(width=weight)) +
+   geom_node_point(size = 25, color="black") +
+   geom_node_text(aes(label = name), size=4, color="white") +
+   coord_fixed() +
+   theme_void()
+
+
+
+# Figure 2
+pdf("export.dir/Figures/gsta1_network_graph.pdf", height=6, width=6)
+graph_gsta1
+dev.off()
+
+pdf("export.dir/Figures/apoa1_network_graph.pdf", height=6, width=6)
+graph_apoa1
+dev.off()
+
+graph_apoa1
+graph_gsta1
+
+```
+
+## Plot a couple of examples
+
+I'm particularly interested in the observation that there are bile acid related genes in the GSTA1 module. I want to look at a couple of examples where bile acid genes correlate with detox genes.
+
+```{r gsta1 example scatters, echo=FALSE, message = FALSE}
+
+
+to_cor_gsta1 <- data.frame(GSTA1 = unlist(counts["GSTA1",]),
+                           FABP6 = unlist(counts["FABP6",]))
+
+ggplot(to_cor_gsta1, aes(x = FABP6, y = GSTA1)) +
+  geom_point(color = annotation_colors_epithelium[[1]], size=0.2) +
+  theme_classic() +
+  stat_smooth(method="lm")
+
+```
+
+
+```{r fgsea module, echo=FALSE, message=FALSE}
+
+pathways <- gmtPathways("~/mirror/msigdb/msigdb_v7.1/msigdb_v7.1_GMTs/c5.bp.v7.1.symbols.gmt")
+apoa1_fgsea <- fgsea::fora(pathways, apoa1_genes, unlist(scwgcna$module.genes))
+apoa1_fgsea <- apoa1_fgsea[order(apoa1_fgsea$padj, decreasing = FALSE),]
+
+gsta1_fgsea <- fgsea::fora(pathways, gsta1_genes, unlist(scwgcna$module.genes))
+gsta1_fgsea <- gsta1_fgsea[order(gsta1_fgsea$padj, decreasing = FALSE),]
+
+# add enrichment ratio
+apoa1_fgsea <- pathway_fold_enrichment(as.data.frame(apoa1_fgsea),
+                                       length(apoa1_genes),
+                                       pathways,
+                                       rownames(counts))
+
+
+gsta1_fgsea <- pathway_fold_enrichment(as.data.frame(gsta1_fgsea),
+                                       length(gsta1_genes),
+                                       pathways,
+                                       rownames(counts))
+
+
+# Plot the results - top 5
+
+## GSTA1
+gsta1_fgsea_top <- gsta1_fgsea[1:5,]
+gsta1_fgsea_top <- gsta1_fgsea_top[order(gsta1_fgsea_top$foldEnrichment, decreasing = FALSE),]
+gsta1_fgsea_top$pathway <- factor(gsta1_fgsea_top$pathway, levels = gsta1_fgsea_top$pathway)
+
+
+gsta_fgsea_plt <- ggplot(gsta1_fgsea_top, aes(x=pathway, y=foldEnrichment)) +
+  geom_bar(stat="identity", fill = annotation_colors_epithelium[[1]]) +
+  theme_classic() +
+  coord_flip()
+
+
+## APOA1
+apoa1_fgsea_top <- apoa1_fgsea[1:5,]
+aopa1_fgsea_top <- apoa1_fgsea_top[order(apoa1_fgsea_top$foldEnrichment, decreasing = TRUE),]
+apoa1_fgsea_top$pathway <- factor(apoa1_fgsea_top$pathway, levels = apoa1_fgsea_top$pathway)
+
+apoa1_fgsea_plt <- ggplot(apoa1_fgsea_top, aes(x=pathway, y=foldEnrichment)) +
+  geom_bar(stat="identity", fill = annotation_colors_epithelium[[2]]) +
+  theme_classic() +
+  coord_flip()
+
+# save plots
+ggsave(gsta_fgsea_plt, file = "export.dir/Figures/gsta1_pathways.pdf", height=2, width=7)
+ggsave(apoa1_fgsea_plt, file = "export.dir/Figures/apoa1_pathways.pdf", height=2, width=7)
+
+gsta_fgsea_plt
+apoa1_fgsea_plt
+
+```
+
+
+## Differential expression - pseudobulk
+
+Here we perform differential expression analysis on pseudobulk expression across cells in cell types that have enough cells (typically >20/individual).
+
+### Enterocytes
+
+We take all enterocytes together i.e. the APOA1 and the GSTA1 high subsets. Given that the DUOX2 ones look so different we don't include these in this initial analysis. The two samples that have very high DUOX2 enterocytes are removed from this analysis as they only have 1 or 3 cells of these major enterocyte subsets.
+
+```{r pseudobulk enterocytes, echo=FALSE, message=FALSE}
+
+# table the number of cells per invididual
+enterocytes <- subset(epithelium, idents = c("Enterocyte_APOA1", "Enterocyte_GSTA1"))
+enterocytes@meta.data$annotation <- as.character(Idents(enterocytes))
+Idents(enterocytes) <- enterocytes@meta.data$orig.ident
+ncells_entero <- as.data.frame(table(Idents(enterocytes)))
+knitr::kable(ncells_entero)
+
+# remove troublesome samples
+enterocytes <- subset(enterocytes, idents = c("G-SCI7T080-SCI5T080", "G-SCI7T033-SCI5T033"), invert=TRUE)
+
+Idents(enterocytes) <- enterocytes@meta.data$annotation
+
+# Write our enterocytes to compare with caecum colonocytes
+saveRDS(enterocytes, file = "export.dir/ileum_enterocytes.Rds")
+
+# aggregate for pseudobulk analysis
+agg_all <- AggregateExpression(enterocytes,
+                               group.by = c("orig.ident"))                                                             
+
+agg_all <- as.data.frame(agg_all)
+colnames(agg_all) <- gsub("RNA\\.", "", colnames(agg_all))
+rownames(metadata) <- gsub("-", "\\.", rownames(metadata))
+coldata <- metadata[colnames(agg_all),]
+dds <- DESeqDataSetFromMatrix(agg_all, colData = coldata, design=~disease_type)
+dds$disease_type <- relevel(dds$disease_type, ref = "HC")
+dds <- dds[rowSums(counts(dds) >= 10) >= 3,]
+dds <- DESeq2::DESeq(dds)
+
+# get results for each contrast
+# lfc shrink
+res1 <- lfcShrink(dds,
+                  contrast = c("disease_type", "PSCUC", "HC"),
+                  res = results(dds, name = "disease_type_PSCUC_vs_HC"),
+                  type = "normal")
+
+res2 <- lfcShrink(dds,
+                  contrast = c("disease_type", "UC", "HC"),
+                  res = results(dds, name = "disease_type_UC_vs_HC"),
+                  type = "normal")
+
+# save the results to compare with caecum colonocytes
+write.table(data.frame(gene = rownames(res1), as.data.frame(res1)),
+            file = "export.dir/ileum_enterocytes_pscuc_vs_healthy.tsv",
+            sep = "\t",
+            quote = FALSE,
+            row.names = FALSE)
+
+```
+
+#### Volcano plot
+
+```{psc enterocytes volcano, echo=FALSE, message=FALSE}
+
+res1_toplot <- res1
+res1$log2FoldChange[res1$log2FoldChange < -5] <- -5
+
+psc_enterocyte_volc <- volcano_plot(res1_toplot, use="padj", labels = c("SPINK1", "GSTA1", "RBP2", "FABP6")) +
+  ggtitle("PSC-UC vs. Healthy") +
+  scale_color_manual(values = "blue3") +
+  theme(legend.position = "none")
+
+psc_enterocyte_volc
+
+# Figure
+ggsave(psc_enterocyte_volc, file = "export.dir/Figures/enterocyte_psc_volcano.pdf", height = 3, width=3)
+
+uc_enterocyte_volc <- volcano_plot(res2, use="padj") +
+  ggtitle("UC vs. Healthy") +
+  scale_color_manual(values = "blue3") +
+  theme(legend.position = "none")
+
+ggsave(uc_enterocyte_volc, file = "export.dir/Figures/enterocyte_uc_volcano.pdf", height = 5, width=5)
+
+uc_enterocyte_volc
+```
+
+```{r table of differences enterocytes, echo=FALSE, message=FALSE}
+
+nup_psc <- nrow(res1[res1$padj < 0.05 & res1$log2FoldChange > 0 & !(is.na(res1$padj)),])
+nup_uc <- nrow(res2[res2$padj < 0.05 & res2$log2FoldChange > 0 & !(is.na(res2$padj)),])
+ndown_psc <- nrow(res1[res1$padj < 0.05 & res1$log2FoldChange < 0 & !(is.na(res1$padj)),])
+ndown_uc <- nrow(res2[res2$padj < 0.05 & res2$log2FoldChange < 0 & !(is.na(res2$padj)),])
+
+results_ent <- data.frame(comparison = resultsNames(dds)[2:3],
+                          no.up = c(nup_psc, nup_uc),
+                          no.down = c(ndown_psc, ndown_uc))
+
+knitr::kable(results_ent)
+```
+
+### Enrichments
+
+```{r enrichments, echo=FALSE, message=FALSE}
+
+genes <- res1$log2FoldChange
+names(genes) <- rownames(res1)
+pathways_gsta1 <- list("GSTA1_Module" = gsta1_genes,
+                       "APOA1_Module" = apoa1_genes)
+
+set.seed(100)
+fgsea_enterocyte_psc <- fgseaMultilevel(pathways_gsta1, genes)
+
+enrich_gsta1 <- plotEnrichment(pathway = pathways_gsta1[["GSTA1_Module"]], genes) +
+  theme_classic() +
+  geom_line(color=annotation_colors_epithelium[[1]], aes(x = rank, y = ES), linewidth = 2) +
+  ggtitle(paste0("fgsea p = ", round(fgsea_enterocyte_psc[2,]$padj, 2))) +
+  ylim(c(-0.8,0.1))
+
+enrich_apoa1 <- plotEnrichment(pathway = pathways_gsta1[["APOA1_Module"]], genes) +
+  theme_classic() +
+  geom_line(color=annotation_colors_epithelium[[2]], aes(x = rank, y = ES), linewidth = 2) +
+  ggtitle(paste0("fgsea p = ", round(fgsea_enterocyte_psc[1,]$padj, 2))) +
+  ylim(c(-0.8,0.1))
+
+ggsave(enrich_gsta1, file = "export.dir/Figures/enterocyte_fgsea_gsta1.pdf", height = 3, width=3)
+ggsave(enrich_apoa1, file = "export.dir/Figures/enterocyte_fgsea_apoa1.pdf", height = 3, width=3)
+
+gridExtra::grid.arrange(enrich_gsta1, enrich_apoa1, nrow = 1)
+```
+
+## Leading edge genes in GSTA1 module
+
+```{r leading edge, echo=FALSE, message=FALSE}
+
+vst_all <- as.data.frame(assay(vst(dds)))
+gois_leadingedge <- unlist(fgsea_enterocyte_psc[2,]$leadingEdge)
+leading_gsta1 <- OCMSutility::featurebox(vst_all, coldata, features=gois_leadingedge, group_by = "disease_type") +
+  theme_classic() +
+  facet_wrap(~feature, scales = "free") +
+  scale_color_manual(values = rep(annotation_colors_epithelium[[1]], 3)) +
+  theme(legend.position = "none")
+
+ggsave(leading_gsta1, file = "export.dir/Figures/gsta1_leading_edge.pdf", height=2.5, width=4)
+gois_leadingedge
+
+leading_gsta1
+
+res1[rownames(res1) %in% gois_leadingedge,]
+
+```
+
+## Bile acid pathway
+
+We expect that genes that are regulated by bile acid signalling would be decreased in PSC because of reduced bbile flow. They don't seem to come out in our analysis but that might be a power issue. Here we look at them to see how they look like
+
+
+```{r bile acid pathways, echo=FALSE, message=FALSE}
+
+bile_acid <- OCMSutility::featurebox(vst_all, coldata, features=c("SLC51A", "SLC10A2", "SLC51B", "FGF19"), group_by = "disease_type") +
+  theme_classic() +
+  facet_wrap(~feature, scales = "free") +
+  scale_color_manual(values = unlist(group_colors)) +
+  theme(legend.position = "none")
+
+ggsave(bile_acid, file = "export.dir/Figures/bile_acid_genes.pdf", height=5, width=7)
+bile_acid
+
+res1[c("SLC51A", "SLC10A2", "SLC51B", "FGF19"),]
+
+```
+
+It's interesting and could be a power issue...
+
+## GSTA genes
+
+There is a lot of homology in the GST alpha family. Here we just see if there is any evidence for changes in other GSTAs
+
+```{r gstas, echo=FALSE, message=FALSE}
+gsta_genes <- OCMSutility::featurebox(vst_all, coldata,
+                                      features=c("GSTA1",
+                                                 "GSTA2"),
+                                      group_by = "disease_type") +
+  theme_classic() +
+  facet_wrap(~feature, scales = "free") +
+  scale_color_manual(values = rep(annotation_colors_epithelium[[1]], 3)) +
+  theme(legend.position = "none")
+gsta_genes
+
+```
+
+## Mouse GSTAs
+
+```{r mouse gstas, echo=FALSE, message = FALSE}
+
+FeaturePlot(merged_ileum, features = c("GSTA1"))
+
+mouse_dat <- readRDS("/well/powrie/shared/scrnaseq_shen/whole_final_annotation.rds")
+
+mouse_dat <- subset(mouse_dat, subset = tissue == "ileum")
+
+spf <- subset(mouse_dat, subset = mice == "SPF")
+gf <- subset(mouse_dat, subset = mice == "GF")
+
+Idents(spf) <- spf@meta.data$celltypes
+Idents(gf) <- gf@meta.data$celltypes
+
+FeaturePlot(spf, features = c("Gsta2"))
+FeaturePlot(gf, features = c("Gsta1", "Gsta2"))
+
+```
+
+
+### Heatmap
+
+```{r psc heatmap, echo=FALSE, message=FALSE}
+
+vst_all <- as.data.frame(assay(vst(dds)))
+
+res1$label <- ifelse(rownames(res1) %in% gsta1_genes, rownames(res1), NA)
+res1$label <- ifelse(rownames(res1) %in% gsta1_genes, rownames(res1), NA)
+
+psc_genes <- rownames(res1[res1$padj < 0.05 & !(is.na(res1$padj)),])
+uc_genes <- rownames(res2[res2$padj < 0.05 & !(is.na(res2$padj)),])
+psc_genes <- setdiff(psc_genes, uc_genes)
+
+col_annotation <- HeatmapAnnotation(disease_type = coldata$disease_type,
+                                    col = list(disease_type = unlist(group_colors)))
+
+heatmap_psc_genes <- Heatmap(ScaleData(vst_all[psc_genes,]), column_gap = unit(2, "mm"),
+        cluster_columns = FALSE,
+        column_split = coldata$disease_type,
+        show_column_names = FALSE,
+        top_annotation = col_annotation,
+        col = colorRamp2(breaks = c(-2,0, 2), c("blue4", "white", "red4")),
+        rect_gp = gpar(col = "white", lwd=1))  
+
+pdf("export.dir/Figures/heatmap_enterocytes_psc.pdf", height = 7, width =7)
+heatmap_psc_genes
+dev.off()
+
+# draw the heatmap
+heatmap_psc_genes
+
+```
+
+### Gene expression on PCA of enterocytes
+
+```{r featureplots of psc gois}
+
+
+FeaturePlot(enterocytes, features=c("MT1X"), split.by="disease_type", reduction = "pca", pt.size=1)
+
+
+```
+

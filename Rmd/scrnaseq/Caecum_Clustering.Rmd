@@ -1,0 +1,622 @@
+---
+title: "Clustering analysis: Forced cells 10000"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(dev.args=list(png=list(type="cairo")))
+options(bitmapType = "cairo")
+
+# reticulate stuff
+reticulate::use_virtualenv('~/devel/venv/Python-3.10.8-GCCcore-12.2.0/skylake/', required=TRUE)
+knitr::opts_knit$set(root.dir="/well/powrie/users/utu691/work/proj072/analysis/final_analysis")
+```
+
+```{r load libraries, echo=FALSE, message=FALSE}
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+source("~/devel/proj060/code/R/gex_helper.R")
+source("~/devel/proj072/R/scfunctions.R")
+library(RColorBrewer)
+library(fgsea)
+library(futile.logger)
+library(harmony)
+library(decontX)
+library(flexmix)
+library(scriabin)
+library(OCMSutility)
+library(circlize)
+
+# create Clustering analysis dir
+if (!(dir.exists("export.dir/Clustering"))){
+  dir.create("export.dir/Clustering")
+}
+```
+
+
+```{r set colors, echo=FALSE, message=FALSE, warning=FALSE}
+
+group_colors <- list("UC" = "red3", "PSCUC" = blues9[6], "HC" = "grey")
+
+```
+
+
+# Overview
+
+This document describes clustering and futher anlysis of the scRNA-seq data that have already had cells filtered out based on basic QC metrics (nfeatures, ncount, %mt etc, in QC_Force_Cells_Refactor.Rmd). I am initially starting with data from the ileum which will be clustered separately from data that we have from the caecum.
+
+## Caecum
+
+```{r get caecum sobjs, echo=FALSE, message=FALSE}
+
+# read in metadata
+metadata <- read.csv("/well/powrie/projects/proj072/analysis/GEX/05_cellranger_pipeline/samples.tsv",
+                     header=TRUE,
+                     stringsAsFactors = FALSE,
+                     sep="\t",
+                     row.names=2)
+
+
+# read in the filtered sobj
+sobjs_filtered <- readRDS("export.dir/QC/all_tissues_filtered.Rds")
+
+# just get the ileum data
+sobjs_caecum <- list()
+for (i in 1:length(sobjs_filtered)){
+  sobj <- sobjs_filtered[[i]]
+  id <- as.character(sobj@meta.data$orig.ident)[1]
+  tissue <- metadata[id,]$tissue[1]
+  if (tissue == "Caecum"){
+     sobjs_caecum[[i]] <- sobj
+  }
+}
+sobjs_caecum <- Filter(Negate(is.null), sobjs_caecum)
+```
+
+
+### Overview of caecum data {.tabset .tabset-pills}
+
+#### Feature scatter plots
+
+```{r caecum overview, echo=FALSE, message=FALSE, fig.height=20, fig.width=20}
+
+feature_scatter_plots <- list()
+for (i in 1:length(sobjs_caecum)){
+  p <-FeatureScatter(sobjs_caecum[[i]], feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+  feature_scatter_plots[[i]] <- p
+}
+
+cowplot::plot_grid(plotlist = feature_scatter_plots, nrow=4)
+
+```
+
+
+```{r merge sobjs across the caecum , echo=FALSE, message=FALSE}
+
+merged_caecum <- merge(sobjs_caecum[[1]],
+                      y = c(sobjs_caecum[[2]],
+                      sobjs_caecum[[3]],
+                      sobjs_caecum[[4]],
+                      sobjs_caecum[[5]],
+                      sobjs_caecum[[6]],
+                      sobjs_caecum[[7]],
+                      sobjs_caecum[[8]],
+                      sobjs_caecum[[9]],
+                      sobjs_caecum[[10]],
+                      sobjs_caecum[[11]],
+                      sobjs_caecum[[12]]))
+```
+
+## Median nummber of read counts per cell
+
+```{r median read count, echo = FALSE, message=FALSE}
+
+med_count <- merged_caecum@meta.data %>%
+  group_by(orig.ident) %>%
+  summarise(median_nCount_RNA = median(nCount_RNA)) %>%
+  as.data.frame()
+
+knitr::kable(med_count)
+
+```
+
+#### Variable features
+
+We are using 2000 variable features and show the top 10 labelled in the plot.
+
+```{r variable features, echo=FALSE, message=FALSE, fig.width=7, fig.height=7}
+
+# find variable features
+merged_caecum <- NormalizeData(merged_caecum)
+merged_caecum <- FindVariableFeatures(merged_caecum, selection.method = "vst", nfeatures = 2000)
+
+top10 <- head(VariableFeatures(merged_caecum), 10)
+
+plot1 <- VariableFeaturePlot(merged_caecum)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+
+gridExtra::grid.arrange(plot1, plot2, nrow=2)
+```
+
+### Dimensionality reduction - PCA
+
+```{r dim reduction caecum, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10}
+
+set.seed(10)
+
+if (!file.exists("export.dir/Clustering/caecum_harmonised_force_cells.rds")){
+  all.genes <- rownames(merged_caecum)
+  merged_caecum <- ScaleData(merged_caecum, features = all.genes)
+  merged_caecum <- FindVariableFeatures(merged_caecum, selection.method = "vst", nfeatures = 2000)
+  merged_caecum <- RunPCA(merged_caecum, features = VariableFeatures(object = merged_caecum))
+ 
+  # harmony integration: by individual = orig.ident
+  merged_caecum <- merged_caecum %>% 
+  RunHarmony("orig.ident", plot_convergence = TRUE)
+  saveRDS(merged_caecum, file = "export.dir/Clustering/caecum_harmonised_force_cells.rds")
+}
+
+merged_caecum <- readRDS("export.dir/Clustering/caecum_harmonised_force_cells.rds")
+
+p_pca <- DimPlot(merged_caecum, reduction = "harmony", group.by = "orig.ident") + NoLegend()
+p_elbow <- ElbowPlot(merged_caecum, ndims = 40)
+
+gridExtra::grid.arrange(p_pca, p_elbow, nrow=1)
+```
+
+### UMAP 
+
+We are using fairly low resolution clustering (0.5) with leiden clustering. We don't have a huge number of cells so I don't want truly fine grained clusters at this stage particularly - especially as there are lots of different types of cells in these samples.
+
+```{r umap caecum, echo=FALSE, message=FALSE, warning=FALSE, fig.height=12, fig.width=12}
+
+set.seed(10)
+
+merged_caecum <- FindNeighbors(merged_caecum, reduction="harmony", dims = 1:30)
+merged_caecum <- FindClusters(merged_caecum, resolution = 0.5, algorithm = 4)
+merged_caecum <- RunUMAP(merged_caecum, dims = 1:30, reduction = "harmony")
+
+# add disease into metadata
+merged_caecum@meta.data$disease_type <- metadata[as.character(merged_caecum@meta.data$orig.ident),]$disease_type
+
+clusters_plot <- DimPlot(merged_caecum, reduction = "umap", label = TRUE)
+clusters_by_sample <- DimPlot(merged_caecum, reduction = "umap", group.by = "orig.ident")
+clusters_by_disease <- DimPlot(merged_caecum, reduction = "umap", group.by = "disease_type")
+
+gridExtra::grid.arrange(clusters_plot,
+                        clusters_by_sample,
+                        clusters_by_disease + scale_color_manual(values = group_colors),
+                        nrow=2)
+```
+
+### Number of cells in the clusters {.tabset .tabset-pills}
+
+Here we look at how many cells there are in each cluster and how many individuals contribute to each cluster. In an ideal world every donor would contribute cells to each cluster but in reality there are different numbers of cells for each donor and so some may be missing from some clusters.
+
+```{r ncells per cluster, echo=FALSE, message=FALSE}
+
+Idents(merged_caecum) <- merged_caecum@meta.data$seurat_clusters
+clusters <- unique(merged_caecum@meta.data$seurat_clusters)
+ncells_cluster = list()
+ninds_cluster = list()
+
+for (i in 1:length(clusters)){
+  flog.info(paste0("Counting cells for cluster ", clusters[i]))
+  dat <- subset(merged_caecum, idents = clusters[i])
+  n <- ncol(dat)
+  nind <- length(unique(as.character(dat@meta.data$orig.ident)))
+  ncells_cluster[[i]] <- n
+  ninds_cluster[[i]] <- nind
+}
+names(ncells_cluster) <- clusters
+names(ninds_cluster) <- clusters
+
+ncells_cluster <- as.data.frame(t(as.data.frame(ncells_cluster)))
+ninds_cluster <- as.data.frame(t(as.data.frame(ninds_cluster)))
+
+ncells_cluster$cluster <- gsub("X", "", rownames(ncells_cluster))
+colnames(ncells_cluster) <- c("ncells", "cluster")
+ninds_cluster$cluster <- gsub("X", "", rownames(ninds_cluster))
+colnames(ninds_cluster) <- c("ninds", "cluster")
+
+# order by cluster size
+ncells_cluster <- ncells_cluster[order(ncells_cluster$ncells, decreasing = FALSE),]
+ncells_cluster$cluster <- factor(ncells_cluster$cluster, levels = ncells_cluster$cluster)
+ninds_cluster$cluster <- factor(ninds_cluster$cluster, levels = ncells_cluster$cluster)
+
+ncells_p <- ggplot(ncells_cluster, aes(x=cluster, y=ncells/1000, size=ncells)) +
+  geom_point() +
+  theme_classic() +
+  geom_hline(yintercept = 0.1, linetype = "dashed") +
+  ylab("No. cells (k)") +
+  ylim(c(0,3))
+
+# How different individuals make up the clusters i.e. each cluster by
+# number of individuals represented. Really want all 11 to be present
+# for each cluster
+ninds_p <- ggplot(ninds_cluster, aes(x=cluster, y=ninds, size=ninds)) +
+  geom_point() +
+  theme_classic()
+
+gridExtra::grid.arrange(ncells_p, ninds_p)
+
+```
+
+## Find markers
+
+Here we use FindAllMarkers() to identify the marker genes for each cluster. This will be used downstream in conjunction with manual annotation to annotate the clusters.
+
+```{r find markers, echo=FALSE, message=FALSE, warning=FALSE, fig.height=20, fig.width=20}
+
+# This can take a while so think will write out
+# and just read in if required
+if (!file.exists("export.dir/Clustering/caecum_harmonised_force_cell_markers.tsv")){
+  merged_caecum <- JoinLayers(merged_caecum)
+  markers <- FindAllMarkers(merged_caecum, only.pos = TRUE)
+  markers <- markers %>%
+             group_by(cluster) %>%
+             dplyr::filter(avg_log2FC > 1)
+  
+  write.table(markers,
+              file = "export.dir/Clustering/caecum_harmonised_force_cell_markers.tsv",
+              sep="\t",
+              row.names=FALSE,
+              quote=FALSE)
+}
+
+markers <- read.csv("export.dir/Clustering/caecum_harmonised_force_cell_markers.tsv",
+                    header = TRUE,
+                    stringsAsFactors = FALSE,
+                    sep="\t")  
+top5 <- markers %>%
+    group_by(cluster) %>%
+    top_n(n = 5, wt = pct.1)
+
+ggplot(top5, aes(x = gene, y=avg_log2FC, fill = pct.1)) +
+    geom_bar(stat="identity") +
+    theme_classic() +
+    facet_wrap(~cluster, scales="free") +
+    theme(axis.text.x = element_text(angle = 45, hjust=1))
+```
+
+## Broad annotation 
+
+Here we just look at some common markers used to define specific cell populations - gives a sense of where we need to go.
+
+
+```{r broad annotation, echo=FALSE, message=FALSE, warning=FALSE, fig.height=20, fig.width=20}
+
+FeaturePlot(merged_caecum, reduction = "umap", features = c("VIL1",
+                                                           "FABP6",
+                                                           "PTPRC",
+                                                           "CD3D",
+                                                           "CD19",
+                                                           "CD79A",
+                                                           "CD68",
+                                                           "PDPN",
+                                                           "PDGFRA",
+                                                           "CD4")) 
+
+
+```
+
+### More specific annotation
+
+I am using the definitions from the [TAURUS paper](https://www.nature.com/articles/s41590-024-01994-8/figures/7) to define the different subsets. We will not be as fine-grained as their definitions as we have fewer cells in general but we can make some inferences based on their markers.
+
+
+```{r specific annotation, echo=FALSE, message=FALSE, fig.width = 15}
+
+# T cell markers
+t_cell_genes <- c(
+             "PTPRC", 
+             "CD3D",
+             "CD4",
+             "CD8A",
+             "FOXP3",
+             "IL17A",
+             "TNF",
+             "IFNG",
+             "KLRG1",
+             "SELL",
+             "IL7R",
+             "LEF1",
+             "CD69",
+             "CTLA4",
+             "TCF7",
+             "CCR7",
+             "TRDC",
+             "NKG7",
+             "GZMK",
+             "GZMA")
+
+b_cell_genes <- c("CD19",
+                  "CD79A",
+                  "CD27",
+                  "MZB1",
+                  "IGHA1",
+                  "IGHA2",
+                  "IGHG1",
+                  "IGHG2",
+                  "IGHD",
+                  "CCL3",
+                  "CCL4",
+                  "MEF2B",
+                  "CXCR4",
+                  "CD83")
+
+
+mono_mac_genes <- c("CD68",
+                    "CD14",
+                    "CD74",
+                    "HLA-DRA",
+                    "S100A8",
+                    "S100A9",
+                    "IL1B",
+                    "TCF4",
+                    "C1QA",
+                    "LAMP3")
+
+stromal_genes <- c("PDPN",
+                   "PDGFRA",
+                   "PDGFRB",
+                   "CALD1",
+                   "IGFBP7",
+                   "PECAM1",
+                   "PHGR1",
+                   "THY1",
+                   "LYVE1",
+                   "ACKR1")
+     
+epithelial_cell_genes <- c("VIL1",  
+                          "FABP6",
+                          "FABP1",
+                          "KRT19",
+                          "KRT8",
+                          "APOB",
+                          "DEFA5",
+                          "DEFA6",
+                          "REG3A",
+                          "EPCAM",
+                          "GSTA2",
+                          "GSTA1",
+                          "LGR5",
+                          "OLFM4",
+                          "RGMB",
+                          "SMOC2",
+                          "ASCL2",
+                          "MKI67",
+                          "PCNA",
+                          "TOP2A",
+                          "CCNA2",
+                          "POU2F3",
+                          "GFI1B",
+                          "TRPM5",
+                          "DCLK1",
+                          "CLCA1",
+                          "MUC2",
+                          "SPINK4",
+                          "TFF3",
+                          "AGR2",
+                          "NRXN1",
+                          "CDH19",
+                          "CRYAB",
+                          "CPE",
+                          "NEUROD1",
+                          "BEST4",
+                          "OTOP2")
+
+
+mast_cell_genes <- c( "KIT",
+                     "FCER1A")       
+DotPlot(merged_caecum, 
+        cols = colorRampPalette(c("blue", "red"))(2),
+        features=c(t_cell_genes,
+                   b_cell_genes,
+                   mono_mac_genes,
+                   stromal_genes,
+                   epithelial_cell_genes,
+                   mast_cell_genes),
+        cluster.idents = TRUE) +
+  theme(axis.text.x = element_text(angle=45, hjust=1, size = 8), axis.text.y = element_text(size = 8)) 
+  
+```
+
+
+### Annotations
+
+Here I am putting the broad annotations on the clusters. Cell types will be split off later on because it is unlikely that we can get enough resolution given the diverse cell types at this point.
+
+
+```{r annotation, echo=FALSE, message=FALSE, fig.height=7, fig.width = 7}
+
+new_labels <- c("B_Cell_IgA",
+                "Colonocyte",
+                "CD4_T_Cell",
+                "CD8_T_Cell",
+                "B_Cell",
+                "Colonocyte_2",
+                "T_Cell_Undetermined",
+                "Gamma_Delta_T_Cell",
+                "Endothelial",
+                "Mono_Mac",
+                "Stroma",
+                "Endothelial_2",
+                "Stroma_2",
+                "Tuft_Cell",
+                "B_Cell_Cycling",
+                "Mono_Mac_Inf",
+                "Stroma_3",
+                "Mast_Cell",
+                "Colonocyte_BEST4_OTOP2",
+                "Goblet_Contaminated[B_Cell]")
+                
+names(new_labels) <- levels(merged_caecum)
+merged_caecum <- RenameIdents(merged_caecum, new_labels)
+
+
+```
+
+```{r umap annotations, echo=FALSE, message=FALSE, fig.height = 7, fig.width = 7}
+
+library(OCMSutility)
+
+set.seed(6)
+annotation_colors <- sample(OCMSutility::get_palette(n = 30), 20)
+names(annotation_colors) <- unique(Idents(merged_caecum))
+dplot_all <- DimPlot(merged_caecum, label = TRUE, repel = TRUE) +
+               scale_color_manual(values = annotation_colors) +
+               ggtitle(paste0("No. cells = ", nrow(merged_caecum@meta.data))) +
+               theme(legend.position = "none")
+dplot_all
+
+# write out
+saveRDS(merged_caecum, file = "export.dir/Clustering/caecum_harmonised_force_cells_annotated.Rds")
+
+if (!dir.exists("export.dir/Figures")){
+  dir.create("export.dir/Figures")
+  }
+
+ggsave(dplot_all, file = "export.dir/Figures/Figure_caecum_umap.pdf",
+       height = 5,
+       width = 5)
+
+
+```
+
+## Heatmap the markers we used
+
+```{r heatmap markers, echo = FALSE, message = FALSE}
+
+merged_caecum <- readRDS("export.dir/Clustering/caecum_harmonised_force_cells_annotated.Rds")
+
+# row_annotation
+row_annotation = data.frame("gene" = c(t_cell_genes,
+                                       mono_mac_genes,
+                                       b_cell_genes,
+                                       stromal_genes,
+                                       epithelial_cell_genes,
+                                       mast_cell_genes),
+                            "Type" = c(rep("T Cell", length(t_cell_genes)),
+                                       rep("Mono-Mac", length(mono_mac_genes)),
+                                       rep("B Cell", length(b_cell_genes)),
+                                       rep("Stroma", length(stromal_genes)),
+                                       rep("Epithelium", length(epithelial_cell_genes)),
+                                       rep("Mast Cell", length(mast_cell_genes)))
+                            )
+
+# use normalised and scaled counts for matrix
+scaled_all <- as.data.frame(AggregateExpression(merged_caecum, group.by = "ident")[[1]])
+scaled_all <- ScaleData(NormalizeData(scaled_all))
+scaled_all <- scaled_all[row_annotation$gene,]
+
+# row annotation
+row_anno_colors <- OCMSutility::get_palette(60)[55:60]
+names(row_anno_colors) <- unique(row_annotation[,2])
+row_anno <- rowAnnotation("Cell Type" = row_annotation[,2],
+                          col = list("Cell Type" = row_anno_colors))
+
+# heatmap color scale
+heat_col <- colorRamp2(c(-3, 0, 3), c("blue4", "white", "red3"))
+
+colnames(scaled_all) <- gsub("-", "_", colnames(scaled_all))
+
+h_markers <- Heatmap(scaled_all,
+        right_annotation = row_anno,
+        column_split = factor(colnames(scaled_all), levels = colnames(scaled_all)),
+        row_split = factor(row_annotation$Type, levels = c("Epithelium",
+                                                           "Stroma",
+                                                           "Mono-Mac",
+                                                           "B Cell",
+                                                           "T Cell",
+                                                           "Mast Cell")),
+        use_raster=FALSE,
+        cluster_rows = FALSE,
+        cluster_columns = TRUE,
+        show_row_names = TRUE,
+        row_names_gp = gpar(fontsize = 6),
+        column_gap = unit(0.5, "mm"),
+        row_gap = unit(2, "mm"),
+        col = heat_col)
+
+h_markers
+
+pdf("export.dir/Figures/Heatmap_markers_caecum.pdf",
+    width = 7,
+    height = 10)
+    h_markers
+dev.off()
+
+```
+
+## Number of cells in each cluster
+
+```{r number of cells in each cluster, echo = FALSE, message = FALSE}
+
+clusters <- unique(Idents(merged_caecum))
+ncells_cluster = list()
+ninds_cluster = list()
+
+for (i in 1:length(clusters)){
+  flog.info(paste0("Counting cells for cluster ", clusters[i]))
+  dat <- subset(merged_caecum, idents = clusters[i])
+  n <- ncol(dat)
+  nind <- length(unique(as.character(dat@meta.data$orig.ident)))
+  ncells_cluster[[i]] <- n
+  ninds_cluster[[i]] <- nind
+}
+names(ncells_cluster) <- clusters
+
+ncells_cluster <- as.data.frame(t(as.data.frame(ncells_cluster)))
+
+ncells_cluster$cluster <- gsub("X", "", rownames(ncells_cluster))
+colnames(ncells_cluster) <- c("ncells", "cluster")
+
+# order by cluster size
+ncells_cluster <- ncells_cluster[order(ncells_cluster$ncells, decreasing = FALSE),]
+ncells_cluster$cluster <- factor(ncells_cluster$cluster, levels = ncells_cluster$cluster)
+
+ncells_p_annotated <- ggplot(ncells_cluster, aes(x=cluster, y=ncells/1000, size=ncells, color=cluster)) +
+  geom_point() +
+  theme_classic() +
+  geom_hline(yintercept = 0.1, linetype = "dashed") +
+  ylab("No. cells (k)") +
+  ylim(c(0,3))
+
+ncells_p_annotated <- ncells_p_annotated +
+  scale_color_manual(values = annotation_colors) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
+
+ncells_p_annotated
+
+# Figure 1C
+ggsave(ncells_p_annotated, file = "export.dir/Figures/ncells_caecum.pdf", height=3, width = 5)
+
+ncells_cluster$prop <- (ncells_cluster$ncells/nrow(merged_caecum@meta.data))*100
+
+```
+
+## Number and proportion of cells
+
+For reporting purposes, below are the numbers and proportions of cells in each of the annotated clusters.
+
+```{r broad clustering cell numbers, echo=FALSE, message=FALSE}
+
+knitr::kable(ncells_cluster)
+
+```
+
+
+
+
+
+
+
+
+
+
+

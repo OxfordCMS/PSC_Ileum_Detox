@@ -1,0 +1,155 @@
+---
+title: "Ileum T cells compass"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo=FALSE}
+
+
+# temporary solution to libpaths
+.libPaths("~/R/x86_64-pc-linux-gnu-library/4.3/")
+
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(dev.args=list(png=list(type="cairo")))
+options(bitmapType = "cairo")
+knitr::opts_knit$set(root.dir="/well/powrie/users/utu691/work/proj072/analysis/final_analysis")
+
+```
+
+```{r load libraries, echo=FALSE, message=FALSE}
+
+library(tidyverse)
+library(OCMSutility)
+
+```
+
+
+```{r set colors, echo=FALSE, message=FALSE, warning=FALSE}
+
+group_colors <- list("UC" = "red3", "PSCUC" = blues9[6], "HC" = "grey")
+
+```
+
+
+# Overview
+
+We ran Compass which basically runs flux-balance analysis (FBA) using metabolic models from Recon2. It predicts the chance of active metabolic pathways in single cells. Given our observation of decreased OXPHOS in CD4 and CD8 memory T cells in our data we have run this to see if it is backed up in metabolic modelling i.e. orthogonal analysis approach.
+
+```{r read data, echo = FALSE, message = FALSE}
+
+reactions <- read.csv("~/work/proj072/analysis/compass/reactions.tsv",
+                      header = TRUE,
+                      stringsAsFactors = FALSE,
+                      sep = "\t",
+                      row.names = 1)
+
+# -log10()
+reactions <- -log10(reactions + 1)
+
+# remove those close to constant
+variablist <- apply(reactions, 1, function(x) max(x) - min(x) > 1e-3)
+reactions <- reactions[variablist,]
+
+rx_anno <- read.csv("~/work/proj072/analysis/compass/data/rxn_md.csv",
+                    header = TRUE,
+                    stringsAsFactors = FALSE)
+
+metadata <- read.csv("/well/powrie/projects/proj072/analysis/GEX/05_cellranger_pipeline/samples.tsv",
+                     header=TRUE,
+                     stringsAsFactors = FALSE,
+                     sep="\t",
+                     row.names=2)
+rownames(metadata) <- gsub("-", "\\.", rownames(metadata))
+
+samples <- intersect(rownames(metadata),colnames(reactions))
+metadata <- metadata[samples,]
+
+```
+
+## Reactions distribution
+
+```{r reaction distribution, echo = FALSE, message = FALSE}
+
+react_distr <- data.frame(reactions = rowMeans(reactions))
+ggplot(react_distr, aes(x = reactions)) +
+  geom_histogram() +
+  theme_classic()
+
+```
+
+## Differential abundance in CD4 T cell compartment
+
+Here we use a simple Wilcox test to test for differences between PSC-UC and healthy.
+
+```{r da test, echo = FALSE, message = FALSE}
+
+metadata_sub <- metadata[metadata$disease_type != "UC",]
+reactions_sub <- reactions[,rownames(metadata_sub)]
+
+wilcox_by_row <- function(mat, group, p_adjust_method = "BH") {
+  # Convert to matrix
+  mat <- as.matrix(mat)
+  
+  # Basic checks
+  if (length(group) != ncol(mat)) {
+    stop("Length of 'group' must match number of columns in 'mat'.")
+  }
+  
+  group <- as.factor(group)
+  
+  if (length(levels(group)) != 2) {
+    stop("'group' must contain exactly 2 groups.")
+  }
+  
+  g1 <- levels(group)[1]
+  g2 <- levels(group)[2]
+  
+  # Run test row by row
+  res <- t(apply(mat, 1, function(x) {
+    x1 <- x[group == g1]
+    x2 <- x[group == g2]
+    
+    wt <- wilcox.test(x1, x2, exact = FALSE)
+    
+    c(
+      group1_median = median(x1, na.rm = TRUE),
+      group2_median = median(x2, na.rm = TRUE),
+      statistic = unname(wt$statistic),
+      p_value = wt$p.value
+    )
+  }))
+  
+  res <- as.data.frame(res)
+  res$p_adj <- p.adjust(res$p_value, method = p_adjust_method)
+  res$feature <- rownames(mat)
+  
+  # Reorder columns
+  res <- res[, c("feature", "group1_median", "group2_median", "statistic", "p_value", "p_adj")]
+  
+  rownames(res) <- NULL
+  return(res)
+}
+
+res <- na.omit(wilcox_by_row(reactions_sub, metadata_sub$disease_type))
+res <- res[order(res$p_adj, decreasing = FALSE),]
+
+# Annotate
+rownames(rx_anno) <- rx_anno$rxn_code_nodirection
+res$feature_nodirection <- gsub("_.*", "", res$feature)
+res$annotation <- rx_anno[res$feature_nodirection,]$rxn_name_long
+res$subsystem <- rx_anno[res$feature_nodirection,]$subsystem
+res[grep("Oxidative phosphorylation", res$subsystem),]
+res[grep("Citric acid", res$subsystem),]
+res[grep("Glycolysis", res$subsystem),]
+
+
+
+
+
+```
+
+
+
+

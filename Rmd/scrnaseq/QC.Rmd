@@ -1,0 +1,272 @@
+---
+title: "QC analysis: Forced cells 10000"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(dev.args=list(png=list(type="cairo")))
+knitr::opts_knit$set(root.dir="/well/powrie/users/utu691/work/proj072/analysis/final_analysis")
+options(bitmapType = "cairo")
+
+# reticulate stuff
+reticulate::use_virtualenv('~/devel/venv/Python-3.10.8-GCCcore-12.2.0/skylake/', required=TRUE)
+```
+
+```{r load libraries, echo=FALSE, message=FALSE}
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+source("~/devel/proj060/code/R/gex_helper.R")
+source("~/devel/proj072/R/scfunctions.R")
+library(RColorBrewer)
+library(fgsea)
+library(futile.logger)
+library(harmony)
+library(decontX)
+library(flexmix)
+library(scriabin)
+
+# export directory
+if (!(dir.exists("export.dir"))){
+  dir.create("export.dir")
+}
+
+# create QC dir
+if (!(dir.exists("export.dir/QC"))){
+  dir.create("export.dir/QC")
+}
+```
+
+# Overview
+
+This is just a QC of mitochondrial reads etc to filter out cells that are poor quality. Having spoken to Calli and looked more at the data it is clear that given such a diversity of cell types there isn't a one size fits all approach to filtering which is explored below.
+
+The data were processed with cellranger (using the cellranger pipeline in cellhub) with the parameter to force 10,000 cells (i.e. this was the expected number of cells and so didn't want to filter too many out at this stage).
+
+
+```{r check cells, echo=FALSE, message=FALSE, warning=FALSE}
+
+directories <- list.dirs("/well/powrie/projects/proj072/analysis/GEX/05_cellranger_pipeline/api/cellranger/counts/filtered",
+                         recursive = FALSE)
+sample_names <- basename(directories)
+
+raw_dirs <- list.dirs("/well/powrie/projects/proj072/analysis/GEX/05_cellranger_pipeline/api/cellranger/counts/unfiltered",
+                         recursive = FALSE)
+
+# read the 10X data in and add percent mitochondrial reads
+# Don't want to read this in everytime so saveto rds object
+# I also read in the raw sobjs file in case we need it later on
+if (!(file.exists("export.dir/sobjs_list_force_cells.rds"))){
+    sobjs <- list()
+    raw_sobjs <- list()
+    for (i in 1:length(directories)){
+      directory <- paste0(directories[i], "/", "mtx")
+      raw_dir <- paste0(raw_dirs[i], "/", "mtx")
+      flog.info(paste0("Reading data for sample ", sample_names[i]))
+      sobj <- Read10X(directory)
+      raw_sobj <- Read10X(raw_dir)
+      flog.info(paste0("Creating Seurat object for ", sample_names[i]))
+      sobj <- CreateSeuratObject(counts = sobj, project = sample_names[i])
+      raw_sobj <- CreateSeuratObject(counts = raw_sobj, project = sample_names[i])
+      flog.info(paste0("Calculating % Mt for sample ", sample_names[i]))
+      sobj[["percent.mt"]] <- PercentageFeatureSet(sobj, pattern = "^MT-")
+      sobjs[[sample_names[i]]] <- sobj
+      raw_sobjs[[sample_names[i]]] <- raw_sobj
+    }
+    saveRDS(sobjs, file="export.dir/sobjs_list_force_cells.rds")
+    saveRDS(raw_sobjs, file="export.dir/raw_sobjs_list_force_cells.rds")
+}
+sobjs <- readRDS("export.dir/sobjs_list_force_cells.rds")
+raw_sobjs <- readRDS("export.dir/raw_sobjs_list_force_cells.rds")
+```
+
+```{r read metadata, echo=FALSE, message=FALSE, warning=FALSE}
+
+metadata <- read.csv("/well/powrie/projects/proj072/analysis/GEX/05_cellranger_pipeline/samples.tsv",
+                     header=TRUE,
+                     stringsAsFactors = FALSE,
+                     sep="\t",
+                     row.names=2)
+```
+
+```{r set colors, echo=FALSE, message=FALSE, warning=FALSE}
+
+group_colors <- list("UC" = "red3", "PSCUC" = blues9[6], "HC" = "grey")
+
+```
+
+## QC metrics per sample {.tabset .tabset-pills}
+
+### nFeature_RNA
+
+```{r nfeature rna, echo=FALSE, message=FALSE, warning=FALSE, fig.height=30, fig.width = 20}
+
+# have a look at the QC plots
+vln_plots_nfeature <- list()
+for (i in 1:length(sobjs)){
+  sobj <- sobjs[[i]]
+  plt_nfeature <- VlnPlot(sobj, features = "nFeature_RNA")
+  vln_plots_nfeature[[i]] <- plt_nfeature
+}
+gridExtra::grid.arrange(grobs = vln_plots_nfeature, nrow = 6)
+
+```
+
+### nCount_RNA
+
+```{nCount RNA, echo=FALSE, message=FALSE, fig.height=30, fig.width = 20}
+
+vln_plots_ncount <- list()
+for (i in 1:length(sobjs)){
+  sobj <- sobjs[[i]]
+  plt_ncount <- VlnPlot(sobj, features = "nCount_RNA")
+  vln_plots_ncount[[i]] <- plt_ncount
+}
+gridExtra::grid.arrange(grobs = vln_plots_ncount, nrow = 6)
+
+```
+
+### Mt reads
+
+```{Mt reads, echo=FALSE, message=FALSE, fig.height=30, fig.width = 20}
+
+vln_plots_mt <- list()
+for (i in 1:length(sobjs)){
+  sobj <- sobjs[[i]]
+  plt_mt <- VlnPlot(sobj, features = "percent.mt")
+  vln_plots_mt[[i]] <- plt_mt
+}
+gridExtra::grid.arrange(grobs = vln_plots_mt, nrow=6)
+
+```
+
+### Median mito reads per sample
+
+```{r median mito, echo=FALSE, mmessage=FALSE, warning=FALSE}
+
+median_mito <- list()
+samples <- list()
+for (i in 1:length(sobjs)){
+  med_mito <- median(sobjs[[i]]@meta.data$percent.mt)
+  sample <- as.character(sobjs[[i]]@meta.data$orig.ident[1])
+  median_mito[[sample]] <- med_mito
+}
+median_mito_df <- as.data.frame(t(dplyr::bind_rows(median_mito)))
+
+# Add relevant metadata for annotations in plot
+median_mito_df$sample <- rownames(median_mito_df)
+median_mito_df$tissue <- metadata[median_mito_df$sample,]$tissue
+median_mito_df$disease_type <- metadata[median_mito_df$sample,]$disease
+
+# Sort by highest Mt %
+median_mito_df <- median_mito_df[order(median_mito_df$V1, decreasing = TRUE),]
+median_mito_df$sample <- factor(median_mito_df$sample, levels = median_mito_df$sample)
+ggplot(median_mito_df[median_mito_df$tissue == "Ileum",], aes(x = sample, y = V1, color=disease_type)) +
+  geom_point(size = 3) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust=1)) +
+  facet_wrap(~tissue, scales="free") +
+  ylab("Median % Mt") +
+  geom_hline(yintercept=10, linetype="dashed")  +
+  scale_color_manual(values = group_colors)
+
+ggsave(file = "export.dir/QC/ileum_median_mt.pdf", height = 2.5, width = 3.5)
+```
+
+Enterocytes and epithelial cells are kown to have a lot of mitochondrial RNA expression so things are going to be permissive to begin with. This is shown in the below plot where EPCAM positivity represents groups of cells that have high feature counts and high mitochondrial read counts.
+
+
+
+## Number of features x Mt percent {.tabset .tabset-pills}
+
+### Ileum
+
+```{r features and mt percent, echo=FALSE, message=FALSE, warning = FALSE, fig.height=20, fig.width=20}
+
+# Adding EPCAM expression to show enterocytes as
+# odd looking cells relative to the rest
+feature_scatters <- list()
+for (i in 1:length(sobjs)){
+  sobj <- sobjs[[i]]
+  sample <- as.character(sobj@meta.data$orig.ident[1])
+  toplot <- data.frame(percent_mt = sobj@meta.data$percent.mt,
+                       nFeatures = sobj@meta.data$nFeature_RNA,
+                       sample = as.character(sobj@meta.data$orig.ident),
+                       EPCAM = unlist(sobj@assays$RNA@layers$counts[rownames(sobj@assays$RNA@features@.Data) == "EPCAM",]))
+  toplot$tissue <- metadata[toplot$sample,]$tissue 
+  toplot$disease_type <- metadata[toplot$sample,]$disease_type 
+  feature_scatters[[i]] <- toplot
+}
+
+feature_scatters <- dplyr::bind_rows(feature_scatters)
+ggplot(feature_scatters[feature_scatters$tissue == "Ileum",], aes(x = nFeatures, y = percent_mt, color=log10(EPCAM))) +
+  geom_point(size=0.25) +
+  theme_classic() +
+  facet_wrap(~sample, scales="free", nrow = 4) +
+  geom_hline(yintercept=75) +
+  geom_vline(xintercept = c(500,5000)) +
+  scale_color_gradient2(low="blue", mid="white", high="red", midpoint =0)
+  
+ggsave(file = "export.dir/QC/scatter_with_epcam.pdf", height=10, width = 15)
+```
+
+### Caecum
+
+```{r caecum feature scatters, echo=FALSE, message=FALSE, fig.height=20, fig.width=20}
+
+ggplot(feature_scatters[feature_scatters$tissue == "Caecum",], aes(x = nFeatures, y = percent_mt, color=log10(EPCAM))) +
+  geom_point(size=0.25) +
+  theme_classic() +
+  facet_wrap(~sample, scales="free", nrow=4) +
+#  scale_color_manual(values = group_colors) +
+  geom_hline(yintercept=75) +
+  geom_vline(xintercept = c(500,5000)) +
+  scale_color_gradient2(low="blue", mid="white", high="red", midpoint =0)
+
+```
+
+This plot does display that the enterocytes are anomalous in terms of their mitochondrial content but also that there is some variability between samples in terms of theirenterocyte proportions. This is likely just a reflection of how variable it can be to generate scRNA-seq data from human biopsies.
+
+
+## Filtering
+
+I am going to start with a very permissive filtering to make sure that we keep the enterocytes. Here we see how many cells are left after filtering for 5000 > n Feature_Count > 500; percent.mt < 75%. Also remove cells that were identified as doublets using scrublet.
+
+```{r filter cells, echo=FALSE, message=FALSE, warning=FALSE}
+
+sobjs_filtered <- filter_sobjs(sobjs, 1000, 500, 5000, 75, "/well/powrie/projects/proj072/analysis/GEX/05_cellranger_pipeline/cell.qc.dir/scrublet.dir/") 
+
+# filtered and not decontaminated
+ncells_filtered <- get_ncells(sobjs_filtered)
+ncells_filtered <- ncells_filtered[order(ncells_filtered$ncells, decreasing=TRUE),]
+ncells_filtered$sample <- factor(ncells_filtered$sample, levels=ncells_filtered$sample)
+ncells_filtered$tissue <- metadata[as.character(ncells_filtered$sample),]$tissue
+ncells_filtered$type <- "Regular"
+
+# plot
+ggplot(ncells_filtered, aes(x=sample, y=ncells)) +
+  geom_point(size=3) +
+  theme_classic() +
+  geom_hline(yintercept=500, linetype="dashed") +
+  geom_hline(yintercept=100, linetype="dashed") +
+  theme(axis.text.x = element_text(angle = 45, hjust=1)) +
+  facet_wrap(~tissue)
+  
+```
+
+A few samples have fewer than 500 cells. I am going to keep everything in at the moment and see how things pan out after deeper analysis.
+
+
+```{r write data intermediate, echo=FALSE, message=FALSE}
+
+saveRDS(sobjs_filtered, file = "export.dir/QC/all_tissues_filtered.Rds")
+
+```
+
+
+
+
+

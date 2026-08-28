@@ -1,0 +1,612 @@
+---
+title: "Proteomics preliminary analysis"
+output: html_document
+date: "2025-09-05"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r load libraries, echo = FALSE, message = FALSE, warning = FALSE}
+
+library(tidyverse)
+library(readxl)
+library(OCMSutility)
+source("~/devel/MIGTranscriptomeExplorer/R/MIGTranscriptome_plotting.R")
+source("~/devel/MIGTranscriptomeExplorer/R/MIGTranscriptome_retrieval.R")
+
+```
+
+
+# Overview
+
+These data were generated from RNALater stored ileal biopsy samples from patients with PSC-UC, UC or healthy controls. The main aim of this project was to look for patterns that we have observed previously in scRNA-seq data with respect to decreases in genes involved in cellular detoxification (e.g. GSTA1, Metallothioneins etc). I am using data that Anna provided to give a basic QC and having a preliminary look at differential abundance between groups.
+
+## Age and sex of participants
+
+```{r age and sex, echo = FALSE, message = FALSE, warning = FALSE, warning = FALSE}
+
+group_colors <- c(blues9[5], "red3", "grey")
+names(group_colors) <- c("PSC-UC", "UC", "HC")
+
+
+# read metadata
+prot_meta <- read.csv("~/archive/proj080/metadata/NISEED23_metadata.txt",
+                      header = TRUE,
+                      stringsAsFactors = FALSE,
+                      sep="\t",
+                      colClasses = c(rep(NA, 28), "NULL"))
+colnames(prot_meta)[10] <- "diagnosis"
+prot_meta <- prot_meta[prot_meta$UID != "",]
+rownames(prot_meta) <- prot_meta$UID
+
+prot_meta$Collection.Date..Date. <- ifelse(prot_meta$Collection.Date..Date. == "", NA , prot_meta$Collection.Date..Date.)
+prot_meta$age <- as.numeric(stringi::stri_sub(prot_meta$Collection.Date..Date., -4)) - as.numeric(prot_meta$YOB..date.)
+
+prot_meta <- prot_meta[prot_meta$diagnosis != "",]
+
+# remove the cd one
+prot_meta <- prot_meta[prot_meta$diagnosis != "PSC-CD",]
+
+age_p <- ggplot(prot_meta, aes(x = diagnosis, y = age, color = diagnosis)) +
+  geom_boxplot(outlier.alpha = 0) +
+  geom_jitter(height = 0, width = 0.1) +
+  theme_classic() +
+  scale_color_manual(values = group_colors) +
+  ggpubr::stat_compare_means(comparisons = list(c(1,2), c(1,3)))
+
+sex_p <- ggplot(prot_meta, aes(x = diagnosis, fill = Sex..dropdown..M..F., alpha = 0.5)) +
+  geom_bar(color = "black") +
+  theme_classic() +
+  scale_fill_manual(values = c("red3", "black"))
+
+gridExtra::grid.arrange(age_p, sex_p, nrow = 1) 
+```
+
+```{r metadata table, echo = FALSE, message = FALSE, warning = FALSE, warning = FALSE}
+
+hc <- subset(prot_meta, subset = diagnosis == "HC")
+psc <- subset(prot_meta, subset = diagnosis == "PSC-UC")
+uc <- subset(prot_meta, subset = diagnosis == "UC")
+
+datas <- list(hc, psc, uc)
+names(datas) <- c("HC", "PSC", "UC")
+
+# Medications - broad
+biologics <- c("Adalimuab", "Adalimuab", "Ustekinumab", "Vedolizumab")
+asas <- c("Pentasa", "Octasa", "Mezavant")
+aza <- c("Azathioprine")
+urso <- c("URSO", "UCDA", "UCDA")
+
+metadata_summary <- list()
+for (i in 1:length(datas)){
+  dat <- datas[[i]]
+  sex <- dat$Sex..dropdown..M..F.
+  percent_f <- length(sex[sex == "F"])/length(sex)
+  meds <- strsplit(dat$Medication..text., "; ")
+  bs <- lapply(meds, FUN = function(x) intersect(x, biologics))
+  as <- lapply(meds, FUN = function(x) intersect(x, asas))
+  az <- lapply(meds, FUN = function(x) intersect(x, aza))
+  ur <- lapply(meds, FUN = function(x) intersect(x, urso))
+  
+  bs <- unlist(lapply(bs, function(x) length(x) != 0))
+  bs <- length(bs[bs == TRUE])/length(bs)
+  as <- unlist(lapply(as, function(x) length(x) != 0))
+  as <- length(as[as == TRUE])/length(as)
+  az <- unlist(lapply(az, function(x) length(x) != 0))
+  az <- length(az[az == TRUE])/length(az)
+  ur <- unlist(lapply(ur, function(x) length(x) != 0))
+  ur <- length(ur[ur == TRUE])/length(ur)
+  
+  age <- median(dat$age, na.rm = TRUE)
+  sd_age <- sd(dat$age, na.rm = TRUE)
+  alp <- median(dat$ALP, na.rm = TRUE)
+  sd_alp <- sd(dat$ALP, na.rm = TRUE)
+  
+  metadata_summary[[names(datas)[i]]] <- data.frame(percent_F = round(percent_f,2),
+                                                    age = age,
+                                                    sd_age = sd_age,
+                                                    alp = alp,
+                                                    sd_alp = sd_alp,
+                                                    Aza = az,
+                                                    Urso = ur,
+                                                    Asa = as,
+                                                    Biologics = bs,
+                                                    diagnosis = names(datas)[i]) 
+}
+
+
+metadata_summary <- dplyr::bind_rows(metadata_summary)
+
+knitr::kable(metadata_summary)
+
+```
+
+
+
+## Liver biochemistry {.tabset .tabset-pills}
+
+One of the main things that we are looking at is the effect of cholestasis on gene expression in the ileum. So here we look at liver biochemistry measurements to get an idea of the extent of cholestasis in the patients that we have data for.
+
+### ALP
+
+```{r alp, echo = FALSE, message = FALSE, warning = FALSE}
+
+alp <- ggplot(prot_meta, aes(x = diagnosis, y = ALP, color = diagnosis)) +
+  geom_boxplot(outlier.alpha = 0) +
+  geom_jitter(height = 0, width = 0.1) +
+  scale_color_manual(values = group_colors) +
+  theme_classic() +
+  ggpubr::stat_compare_means(comparisons = list(c(1,2), c(2,3), c(1,3)), size = 3,
+                             label = "p.signif") +
+  ylab("ALP U/L") +
+  theme(legend.position = "none") +
+  geom_hline(yintercept = 162, linetype = "dashed")
+
+alp
+ggsave(alp, file = "export.dir/alp.pdf", height = 2.5, width = 2.5)
+```
+
+### ALT
+
+```{r alt, echo = FALSE, message = FALSE, warning = FALSE}
+
+alt <- ggplot(prot_meta, aes(x = diagnosis, y = ALT, color = diagnosis)) +
+  geom_boxplot(outlier.alpha = 0) +
+  geom_jitter(height = 0, width = 0.1) +
+  scale_color_manual(values = group_colors) +
+  theme_classic() +
+  ggpubr::stat_compare_means(comparisons = list(c(1,2), c(2,3), c(1,3)), size = 3,
+                             label = "p.signif")
+
+alt
+```
+
+
+### Bilirubin
+
+
+```{r bilirubin, echo = FALSE, message = FALSE, warning = FALSE}
+
+bil <- ggplot(prot_meta, aes(x = diagnosis, y = Bilirubin, color = diagnosis)) +
+  geom_boxplot(outlier.alpha = 0) +
+  geom_jitter(height = 0, width = 0.1) +
+  scale_color_manual(values = group_colors) +
+  theme_classic() +
+  ggpubr::stat_compare_means(comparisons = list(c(1,2), c(2,3), c(1,3)), size = 3,
+                             label = "p.signif")
+
+bil
+```
+
+
+## ALP vs. ALT
+
+There isn't consistency between liver function tests particularly but I will have a look at the relationship between ALP and ALT anyway - likely they are correlated in the PSC patients.
+
+```{r alt vs alp, echo = FALSE, message = FALSE, warning = FALSE}
+
+psc_meta <- prot_meta[prot_meta$diagnosis == "PSC-UC",]
+
+# upper limit of the HC
+alp_up <- max(prot_meta$ALP[prot_meta$diagnosis == "HC"], na.rm = TRUE)
+alt_up <- mean(prot_meta$ALT[prot_meta$diagnosis == "HC"], na.rm = TRUE)
+
+ggplot(prot_meta, aes(x = ALP, y = ALT)) +
+  geom_point(size = 3) +
+  theme_classic() +
+  stat_smooth(method = "lm") +
+  ggpubr::stat_cor() +
+  geom_hline(yintercept = alt_up, linetype = "dashed") +
+  geom_vline(xintercept = alp_up*1.5, linetype = "dashed")
+
+
+# Write out this subsetted and changed metadata
+if (!dir.exists("export.dir")){
+  dir.create("export.dir")
+}
+write.table(prot_meta,
+            file = "export.dir/metadata_clean.tsv",
+            row.names = FALSE,
+            quote = FALSE,
+            sep = "\t")
+
+```
+
+
+It's kind of tricky but not all patients have very elevated ALP and ALT levels relative to healthy individuals. Whether this impacts on downstream analysis we will need to keep and eye on.
+
+
+## Protein abundance distribution
+
+Anna has done imputation and normalisation and so the number of proteins is equivalent across samples. Here I will look at the abundance distribution to see if any filtering should be done.
+
+
+```{r abundance distribution, echo=FALSE, message=FALSE}
+
+prots <- read_xlsx("~/archive/proj080/proteomics/NickIllotResults_MSQ2955.xlsx",
+                  sheet = 1)
+prots <- as.data.frame(prots)
+
+prots <- prots[,c(3,5:47)]
+
+# filter proteins that are na
+prots <- prots[!is.na(prots$`T: Genes`),]
+rownames(prots) <- prots$`T: Genes`
+prots <- prots[,2:ncol(prots)]
+
+colnames(prots) <- gsub("Sample", "NI_PS_", colnames(prots))
+
+metadata_no_na <- prot_meta[!is.na(prot_meta$ALP),]
+
+# 162 is 1.5x the upper limit of the HC group
+metadata_no_na$ALPbin <- ifelse(metadata_no_na$ALP >= 162, "High", "Low")
+
+metadata_no_na$diagnosis <- paste0(metadata_no_na$diagnosis, metadata_no_na$ALPbin)
+
+# get combined samples
+samples <- intersect(rownames(prot_meta), colnames(prots))
+
+prots <- prots[,samples]
+prot_meta <- prot_meta[samples,]
+
+abundance_distribution <- data.frame(gene = rownames(prots),
+                                     ave_abund = rowMeans(prots, na.rm = TRUE))
+
+
+ggplot(abundance_distribution, aes(ave_abund)) +
+  geom_histogram() +
+  theme_classic() +
+  scale_x_log10()
+
+```
+
+There is a bit of a tail but nothing too extreme. Will keep everything for now.
+
+
+## Protein abundance distribution
+
+This is the protein abundance distribution per sample it lets us know whether the normalisation between samples has been effective.
+
+
+```{r sample distributions, echo=FALSE, message = FALSE, warning = FALSE}
+sample_dist <- tidyr::pivot_longer(prots, cols = everything())
+sample_dist$diagnosis <- prot_meta[sample_dist$name,]$diagnosis
+ggplot(sample_dist, aes(x = name, y=value, fill = diagnosis)) +
+  geom_boxplot() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = group_colors)
+
+```
+
+Looks pretty good.
+
+
+# Comparing RNA to protein
+
+We have RNA-seq data on the same samples. We didn't see a whole lot of differences at the transcriptional level but do want to compare proteins and transcripts with the potential to perform a multi-omics integration analysis. Here I start to explore the relationship between RNA and protein.
+
+```{r RNA vsa. protein, echo = FALSE, message = FALSE, warning = FALSE}
+
+
+# get the RNA data
+vst_agg <- read.csv("/well/powrie/users/utu691/work/proj080/analysis/rnaseq/differential_expression/export.dir/transformed_counts_symbols.tsv",
+                   header = TRUE,
+                   stringsAsFactors = FALSE,
+                   sep = "\t",
+                   row.names = 1)
+
+# make RNA and Protein the same samples
+# protein has fewer samples
+vst_agg <- vst_agg[,colnames(prots)]
+
+# compare all - even if they aren't present in both
+# datasets
+rna <- data.frame(gene = rownames(vst_agg),
+                  mean_rna = rowMeans(vst_agg))
+prt <- data.frame(gene = rownames(prots),
+                  mean_rna = rowMeans(prots))
+
+
+rna_prt <- merge(rna, prt, all.x = TRUE, all.y = TRUE, by = "gene")
+
+colnames(rna_prt) <- c("gene", "RNA_mean", "Protein_mean")
+#rna_prt$RNA_mean <- ifelse(is.na(rna_prt$RNA_mean), 0, rna_prt$RNA_mean)
+#rna_prt$Protein_mean <- ifelse(is.na(rna_prt$Protein_mean), -6, rna_prt$Protein_mean)
+
+
+# Genes of interest in the context of GSTA1 are the GSTA1 module genes
+# So create the gois list here
+gsta1_genes <- list(GSTA1_Module = c("GSTA1", "MT1H", "MT1M", "HLA-B", "MT1G", "MT1F", "ACTB", "CCL25", "TMSB10", "FABP1", "FABP6", "KRT8", "LCN2", "REG1A", "FAM151A", "PIGR", "RBP2"))
+
+# annotate with some genes of interest
+rna_prt$anno <- ifelse(rna_prt$gene %in% gsta1_genes[["GSTA1_Module"]],
+                       "GOI",
+                       "Not_GOI")
+rna_prt$gene_anno <- ifelse(rna_prt$anno == "GOI",  rna_prt$gene, NA)
+                                           
+
+rna_prt_plot <- ggplot(rna_prt, aes(x = RNA_mean, y = Protein_mean, color = anno, size = anno)) +
+  geom_point(alpha = 0.5) +
+  theme_classic() +
+  stat_smooth(data = rna_prt, color = "snow4", method = "lm", aes(x = RNA_mean, y = Protein_mean), inherit.aes = FALSE) +
+  ggpubr::stat_cor(data = rna_prt, aes(x = RNA_mean, y = Protein_mean), inherit.aes = FALSE) +
+  scale_color_manual(values = c("#386CB0", "snow3")) +
+  scale_size_manual(values = c(4,1)) +
+  ggrepel::geom_text_repel(label = rna_prt$gene_anno) +
+  geom_point(data = rna_prt[rna_prt$anno == "GOI",]) +
+  theme(legend.position = "none")
+
+rna_prt_plot
+ggsave(rna_prt_plot, file = "export.dir/protein_vs_rna.pdf", height = 5, width = 5)
+
+
+```
+
+
+This looks pretty standard for a correlation (mean) between RNA levels and protein levels. These transcript levels are not length corrected but things may not change that much. I should use RPKM or the like in future analysis.
+
+## Correlations across individuals
+
+It is also of interest to look at how these genes are correlated across individuals i.e do people with higher mRNA levels have higher transcript levels.
+
+
+```{r cors individuals, echo = FALSE, message = FALSE, warning = FALSE}
+
+gois <- gsta1_genes[["GSTA1_Module"]]
+gois <- gois[gois != "MT1M" & gois != "ACTB"]
+
+to_cor <- list()
+for (goi in gois){
+  protein <- unlist(prots[goi, ])
+  rna <- unlist(vst_agg[goi,])
+  df <- data.frame(Prot = protein, RNA = rna, goi = goi)
+  to_cor[[goi]] <- df
+}
+to_cor <- dplyr::bind_rows(to_cor)
+
+cors_plot <- ggplot(to_cor, aes(x = RNA, y = Prot)) +
+  geom_point(size = 0.5) +
+  theme_classic() +
+  facet_wrap(~goi, scales = "free", nrow = 3) +
+  ggpubr::stat_cor(size = 1) +
+  stat_smooth(method = "lm", color = "black")
+
+ggsave(cors_plot, file = "export.dir/gois_protein_rna.pdf", height = 5, width = 6.5)
+cors_plot
+
+
+
+```
+
+For the most part, for our genes of interest the protein levels are pretty well predicted by the RNA levels.
+
+
+
+```{r metadata alp, echo = FALSE, message = FALSE, warning = FALSE}
+
+# set groups based on alp - this is the same as in the RNA-seq analysis
+prot_meta$ALPbin <- ifelse(prot_meta$ALP >= 162, "High", "Low")
+prot_meta$diagnosis <- paste0(prot_meta$diagnosis, prot_meta$ALPbin)
+metadata_no_na <- prot_meta[!is.na(prot_meta$ALP),]
+
+```
+
+
+## PCA of proteomics data
+
+This is the PCA using proteomics data. 
+
+```{r pca proteomics, echo = FALSE, message = FALSE, warning = FALSE}
+
+# new group colors
+new_group_colors <- group_colors
+new_group_colors <- append(new_group_colors, blues9[8])
+names(new_group_colors) <- c("PSCUCLow", "UCLow", "HCLow", "PSCUCHigh")
+
+# make agegroup variable
+# Make age group variable
+metadata_no_na$agegroup <- ifelse(metadata_no_na$age >= 17 & metadata_no_na$age <= 25, "group1", NA)
+metadata_no_na$agegroup <- ifelse(metadata_no_na$age >= 26 & metadata_no_na$age <= 35, "group2", metadata_no_na$agegroup)
+metadata_no_na$agegroup <- ifelse(metadata_no_na$age >= 36 & metadata_no_na$age <= 45, "group3", metadata_no_na$agegroup)
+metadata_no_na$agegroup <- ifelse(metadata_no_na$age >= 46 & metadata_no_na$age <= 55, "group4", metadata_no_na$agegroup)
+metadata_no_na$agegroup <- ifelse(metadata_no_na$age >= 56, "group5", metadata_no_na$agegroup)
+
+# impute for missing
+metadata_no_na$agegroup <- ifelse(is.na(metadata_no_na$agegroup), "group5", metadata_no_na$agegroup)
+
+# Change the sex variable
+metadata_no_na$sex <- metadata_no_na$Sex..dropdown..M..F.
+
+metadata_no_na$diagnosis <- gsub("-", "", metadata_no_na$diagnosis)
+
+pc_prot <- runPCA(prots[,rownames(metadata_no_na)], scale = FALSE)
+
+pca_prot <- plotPrincipleComponents(pc_prot,
+                        metadata_no_na,
+                        colourby = "diagnosis",
+                        group = "diagnosis") +
+  theme_classic() +
+  stat_ellipse() +
+  scale_color_manual(values = new_group_colors)
+
+pca_prot
+ggsave(pca_prot, file = "export.dir/pca_proteins.pdf", height = 2.5, width = 4)  
+
+set.seed(10)
+vegan::adonis2(t(prots[,rownames(metadata_no_na)]) ~ diagnosis + agegroup + sex,
+               data = metadata_no_na,
+               by = "margin",
+               na.action = na.omit,
+               method = "euclidean")
+
+```
+
+## Differential abundance
+
+I am going to run linear models controlling for sex and age group as we did for the RNA-seq and see how our genes of interest look in terms of differences in the PSC-UC + High ALP group.  
+
+```{r linear models, echo = FALSE, message = FALSE, warning = FALSE}
+
+# subset the protein abundance data and the 
+# metadata for common samples
+samples_prots <- intersect(rownames(metadata_no_na), colnames(prots))
+prt <- prots[,samples_prots]
+met <- metadata_no_na[samples_prots,]
+
+lm_results <- list()
+for (i in 1:nrow(prt)){
+  
+  l <- lm(unlist(prt[i,]) ~ met$age + met$sex + met$diagnosis)
+
+  x <- summary(l)
+  
+  # P-values
+  age_p <- x[[4]][20]
+  sex_p <- x[[4]][21]
+  psc_high_p <- x[[4]][22]
+  psc_p <- x[[4]][23]
+  uc_p <- x[[4]][24]
+  
+  # estimates
+  age_e <- x[[4]][2]
+  sex_e <- x[[4]][3]
+  psc_high_e <- x[[4]][4]
+  psc_e <- x[[4]][5]
+  uc_e <- x[[4]][6]
+  
+  df <- data.frame(Gene = rownames(prt)[i],
+                   age_p = age_p,
+                   psc_high_p = psc_high_p,
+                   psc_low_p = psc_p,
+                   uc_p = uc_p,
+                   age_estimate = age_e,
+                   sex_estimate = sex_e,
+                   psc_high_estimate = psc_high_e,
+                   psc_low_estimate = psc_e,
+                   uc_estimate = uc_e)
+ lm_results[[i]] <- df
+}
+lm_results <- dplyr::bind_rows(lm_results)
+
+# table of the gois
+knitr::kable(subset(lm_results, subset = Gene %in% gois))
+
+
+```
+
+## Plot the genes of interest
+
+```{r gois plots, echo = FALSE, message = FALSE, warning = FALSE}
+
+gois <- c("GSTA1",  "MT1H", "MT1F", "FAM151A")
+
+## For plotting genes of interest
+ss <- intersect(colnames(prots), rownames(metadata_no_na))
+goi_featurebox <- featurebox(prots[,ss],
+           metadata_no_na[ss,],
+           group_by = "diagnosis",
+           features = gois) +
+  facet_wrap(~feature, scales = "free") +
+  theme_classic() +
+  scale_color_manual(values = new_group_colors) +
+  theme(axis.text.x = element_text(hjust = 1, angle = 45), legend.position = "none")
+
+goi_featurebox
+ggsave(goi_featurebox, file = "export.dir/protein_gois_featurebox.pdf", height = 2.5, width = 5)
+
+```
+
+## Correlating
+
+```{r alp correlations, echo = FALSE, message = FALSE}
+
+
+to_cor <- metadata_no_na[ss,]
+to_cor$GSTA1 <- unlist(prots["GSTA1", ss])
+to_cor$RBP2 <- unlist(prots["RBP2", ss])
+to_cor$MT1F <- unlist(prots["MT1F", ss])
+to_cor$MT1H <- unlist(prots["MT1H", ss])
+to_cor$FABP6 <- unlist(prots["FABP6", ss])
+to_cor$FABP1 <- unlist(prots["FABP1", ss])
+
+
+ggplot(to_cor, aes(x = log10(ALP), y = GSTA1)) +
+  geom_point() +
+  theme_classic() +
+  stat_smooth(method = "lm") +
+  ggpubr::stat_cor()
+
+
+ggplot(to_cor, aes(x = log10(ALP), y = RBP2)) +
+  geom_point() +
+  theme_classic() +
+  stat_smooth(method = "lm") +
+  ggpubr::stat_cor()
+
+ggplot(to_cor, aes(x = log10(ALP), y = MT1F)) +
+  geom_point() +
+  theme_classic() +
+  stat_smooth(method = "lm") +
+  ggpubr::stat_cor()
+
+ggplot(to_cor, aes(x = log10(ALP), y = MT1H)) +
+  geom_point() +
+  theme_classic() +
+  stat_smooth(method = "lm") +
+  ggpubr::stat_cor()
+
+ggplot(to_cor, aes(x = log10(ALP), y = FABP6)) +
+  geom_point() +
+  theme_classic() +
+  stat_smooth(method = "lm") +
+  ggpubr::stat_cor()
+
+ggplot(to_cor, aes(x = log10(ALP), y = FABP1)) +
+  geom_point() +
+  theme_classic() +
+  stat_smooth(method = "lm") +
+  ggpubr::stat_cor()
+
+```
+
+# output data
+
+```{r write data, echo = FALSE, message = FALSE}
+
+# output a reduced metadata set with - UID, RNA_ID, Protein_ID, diagnosis, ALP, ALT, GGT, sex, agegroup, age, ALPbin
+output_meta <- as.data.frame(metadata_no_na[,c("UID",
+                                 "RNA_ID",
+                                 "Protein_ID",
+                                 "diagnosis",
+                                 "ALP",
+                                 "sex",
+                                 "age",
+                                 "agegroup",
+                                 "ALPbin")])
+write.table(output_meta,
+            file = "export.dir/proteomics_metadata.tsv",
+            sep = "\t",
+            quote = FALSE,
+            row.names = FALSE)
+
+
+write.table(data.frame(Protein = rownames(prt), prt),
+            file = "export.dir/proteomics_processed.tsv",
+            sep = "\t",
+            quote = FALSE, 
+            row.names = FALSE)
+
+```
+
+
+
+
+
+
+

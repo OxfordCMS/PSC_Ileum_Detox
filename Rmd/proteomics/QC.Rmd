@@ -1,0 +1,299 @@
+---
+title: "Proteomics QC"
+output: html_document
+date: "2025-09-05"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r load libraries, echo = FALSE, message = FALSE}
+
+library(tidyverse)
+source("~/devel/MIGTranscriptomeExplorer/R/MIGTranscriptome_plotting.R")
+source("~/devel/MIGTranscriptomeExplorer/R/MIGTranscriptome_retrieval.R")
+
+```
+
+
+## Number of proteins
+
+```{r nproteins, echo=FALSE, message=FALSE}
+
+prots <- read.csv("~/archive/proj080/diann_results.txt",
+                  header = TRUE,
+                  stringsAsFactors = FALSE,
+                  sep="\t")
+prots <- prots[,c(3,6:ncol(prots))]
+
+colnames(prots) <- gsub("X", "", colnames(prots))
+colnames(prots) <- gsub("UC|PSC\\.UC|HC", "", colnames(prots))
+colnames(prots) <- paste0("NI_PS_", colnames(prots))
+colnames(prots)[1] <- "Gene" 
+prots <- prots[prots$Gene != "",]
+
+prots[prots == ""] <- NA
+
+# aggregate by gene
+rownames(prots) <- prots$Gene
+
+# read metadata
+prot_meta <- read.csv("~/archive/proj080/metadata/proteomics_metadata_sub.txt",
+                      header = TRUE,
+                      stringsAsFactors = FALSE,
+                      sep="\t", 
+                      row.names = 2)
+colnames(prot_meta)[9] <- "diagnosis"
+
+# get combined samples
+samples <- intersect(rownames(prot_meta), colnames(prots))
+
+prots <- prots[,samples]
+prot_meta <- prot_meta[samples,]
+
+
+nproteins <- data.frame(sample = colnames(prots),
+                        nprot = colSums(!is.na(prots)))
+ggplot(nproteins, aes(x = sample, y = nprot)) +
+  geom_bar(stat = "identity") +
+  theme_classic() +
+  coord_flip()
+
+```
+
+Remove those with < 4000 proteins.
+
+## Prevalence abundance
+
+```{r prev abund, echo = FALSE, message=FALSE}
+
+prots <- prots[,colSums(!is.na(prots)) > 4000]
+
+prev_abund <- data.frame(prevalence = rowSums(!is.na(prots)),
+                         abundance = rowMeans(prots, na.rm = TRUE))
+ggplot(prev_abund, aes(x = log10(abundance), y = prevalence)) +
+  geom_point() +
+  theme_classic()
+```
+
+
+## Number of samples per group
+
+
+```{r abundance distribution, echo = FALSE, message = FALSE}
+abundance_distribution <- data.frame(gene = rownames(prots),
+                                     ave_abund = rowMeans(prots, na.rm = TRUE))
+
+
+ggplot(abundance_distribution, aes(ave_abund)) +
+  geom_histogram() +
+  theme_classic() +
+  scale_x_log10()
+
+```
+
+
+## Protein abundance distribution
+
+
+```{r sample distributions, echo=FALSE, message = FALSE}
+
+group_colors <- c(blues9[5], "red3", "grey")
+names(group_colors) <- c("PSC-UC", "UC", "HC")
+
+sample_dist <- tidyr::pivot_longer(prots, cols = everything())
+sample_dist$diagnosis <- prot_meta[sample_dist$name,]$diagnosis
+ggplot(sample_dist, aes(x = name, y=log10(value), fill = diagnosis)) +
+  geom_boxplot() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = group_colors)
+
+
+```
+
+They actually look pretty ok with log10(). May quantile normalise as well just to be conservative.
+
+```{r quantile, echo = FALSE, message = FALSE}
+library(preprocessCore)
+prots_q <- as.data.frame(normalize.quantiles(as.matrix(log10(prots)), keep.names = TRUE))
+
+sample_dist <- tidyr::pivot_longer(prots_q, cols = everything())
+sample_dist$diagnosis <- prot_meta[sample_dist$name,]$diagnosis
+ggplot(sample_dist, aes(x = name, y=log10(value), fill = diagnosis)) +
+  geom_boxplot() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = group_colors)
+
+```
+
+
+## PCA
+
+
+
+```{r pca, echo=FALSE, message=FALSE}
+
+# remove outliers
+
+
+prot_meta <- prot_meta[colnames(prots_q),]
+
+pc <- runPCA(prots_q)
+
+plotPrincipleComponents(pc,
+                        metadata = prot_meta,
+                        colourby = "diagnosis",
+                        group = "diagnosis",
+                        pcs = c("PC1", "PC2")) +
+  scale_color_manual(values = group_colors) +
+  stat_ellipse()
+
+plotPrincipleComponents(pc,
+                        metadata = prot_meta,
+                        colourby = "Extraction_batch",
+                        group = "Extraction_batch",
+                        pcs = c("PC1", "PC2")) +
+  stat_ellipse()
+
+plotPrincipleComponents(pc,
+                        metadata = prot_meta,
+                        colourby = "Sex..dropdown..M..F.",
+                        group = "Sex..dropdown..M..F.",
+                        pcs = c("PC1", "PC2")) +
+  stat_ellipse()
+
+```
+
+
+## T-tests
+
+Assume that the data are normally distributed
+
+```{r t tests, echo = FALSE, message = FALSE}
+
+calculate_fold_change <- function(abundance, metadata, ref = "HC"){
+  # add min value to everything to get out of negatives??
+  abundance <- abundance + min(abundance)
+  abund_ref <- mean(abundance[metadata$diagnosis == ref])
+  abund_test <- mean(abundance[metadata$diagnosis != ref])
+  fold <- log2(abund_test/abund_ref)
+}
+
+run_ttest <- function(mat, metadata, ref = "HC"){
+  results <- list()
+  for (i in 1:nrow(mat)){
+    abund <- unlist(mat[i,])
+    abund_ref <- abund[metadata$diagnosis == ref]
+    abund_test <- abund[metadata$diagnosis != ref]
+    t_res <- t.test(abund_ref, abund_test)
+    p_val <- unlist(t_res[3], use.names = FALSE)
+    fold <- calculate_fold_change(abund, metadata, ref = ref)
+    results[[i]] <- data.frame("t" = t_res[1],
+                               "p_val" = p_val,
+                               "log2FoldChange" = fold)
+    }
+  results <- dplyr::bind_rows(results)
+  rownames(results) <- rownames(mat)
+  results$padj <- p.adjust(results$p_val, method = "BH")
+  results <- results[order(results$padj, decreasing = FALSE),]
+  return(results)
+}
+
+meta_psc <- prot_meta[prot_meta$diagnosis %in% c("HC", "PSC-UC"),]
+prots_psc <- prots[,rownames(meta_psc)]
+
+res_psc <- run_ttest(prots_psc, meta_psc)
+res_psc$fcp <- -log10(res_psc$p_val)*res_psc$log2FoldChange
+res_psc <- res_psc[order(res_psc$fcp, decreasing = FALSE),]
+
+
+
+```
+
+## Pathway enrichment
+
+There isn't anything particularly significant from this analysis Will look for pathway enrichment based on fold change.
+
+```{r pathways, echo=FALSE, message=FALSE}
+
+pathways <- fgsea::gmtPathways("~/mirror/msigdb/msigdb_v7.1/msigdb_v7.1_GMTs/c5.bp.v7.1.symbols.gmt")
+
+genes <- res_psc$log2FoldChange
+names(genes) <- rownames(res_psc)
+genes <- genes[is.finite(genes)]
+
+fgsea_res_psc <- fgsea::fgsea(pathways, genes, minSize = 50, maxSize = 500)
+fgsea_res_psc <- as.data.frame(fgsea_res_psc[order(fgsea_res_psc$padj, decreasing = FALSE),])
+
+genes_sig_down <- rownames(res_psc[res_psc$p_val < 0.05 & res_psc$log2FoldChange > 0,])
+
+fgsea_fora_res <- fgsea::fora(pathways, genes_sig_down, minSize = 50, maxSize = 500, universe = rownames(res_psc))
+fgsea_fora_res <- as.data.frame(fgsea_fora_res[order(fgsea_fora_res$padj, decreasing = FALSE),])
+
+```
+
+
+
+
+
+## Linear models
+
+Using maaslin2 because it is easy to implement...
+
+
+```{r linear models, echo = FALSE, message - FALSE}
+
+library(Maaslin2)
+
+Maaslin2(prots,
+                prot_meta,
+                min_abundance = -Inf,
+                min_prevalence = 0,
+                normalization = "NONE",
+                transform = "NONE",
+                analysis_method = "LM",
+                output = "maaslin2",
+                fixed_effects = "diagnosis",
+                reference = "diagnosis,HC")
+
+res <- read.csv("maaslin2/all_results.tsv",
+                header = TRUE, 
+                stringsAsFactors = FALSE,
+                sep="\t")
+
+res_psc <- res[res$value == "PSC-UC",]
+
+
+genes <- res_psc$coef
+names(genes) <- res_psc$feature
+genes <- genes[is.finite(genes)]
+
+oxphos <- pathways[grep("GO_OXIDATIVE_PHOSPHORYLATION", names(pathways))]
+
+fgsea_res_psc <- fgsea::fgsea(oxphos, genes, minSize = 50, maxSize = 500)
+fgsea_res_psc <- as.data.frame(fgsea_res_psc[order(fgsea_res_psc$padj, decreasing = FALSE),])
+
+
+genes_sig_down <- res_psc$feature[res$pval < 0.05 & res$coef < 0]
+
+fgsea_fora_res <- fgsea::fora(pathways, genes_sig_down, minSize = 50, maxSize = 500, universe = res_psc$feature)
+fgsea_fora_res <- as.data.frame(fgsea_fora_res[order(fgsea_fora_res$padj, decreasing = FALSE),])
+
+
+res <- res[order(res$pval, decreasing = FALSE),]
+res[res$feature == "GSTA1",]
+
+library(OCMSutility)
+
+featurebox(prots, prot_meta, features = c("AK4","COX7A1","COX7C","NDUFA3","DMAC2L","SDHD","SNCA","NDUFA1"), group_by = "diagnosis") +
+  ggpubr::stat_compare_means(comparisons = list(c(1,2), c(1,3), c(2,3)), method = "t.test") +
+  facet_wrap(~feature, scales = "free")
+
+
+```

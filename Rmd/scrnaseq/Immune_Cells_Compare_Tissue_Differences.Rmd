@@ -1,0 +1,438 @@
+---
+title: "Immune Cells Compare Differences"
+output: html_document
+date: "2026-02-17"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir="/well/powrie/users/utu691/work/proj072/analysis/final_analysis")
+```
+
+```{r load libraries, echo = FALSE, message = FALSE}
+
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+source("~/devel/proj060/code/R/gex_helper.R")
+source("~/devel/proj072/R/scfunctions.R")
+library(RColorBrewer)
+library(fgsea)
+library(futile.logger)
+library(harmony)
+library(speckle)
+library(scWGCNA)
+library(circlize)
+library(ggraph)
+library(igraph)
+library(DESeq2)
+library(OCMSutility)
+
+```
+
+```{r colors, echo = FALSE, message = FALSE}
+
+group_colors <- list("UC" = "red3", "PSCUC" = blues9[6], "HC" = "grey")
+
+```
+
+
+```{r create directory, echo = FALSE, message = FALSE}
+
+if (!(dir.exists("export.dir/Comparison"))){
+  dir.create("export.dir/Comparison")
+}
+
+```
+
+# Overview
+
+This is an analysis of how differences in CD4 T cells look in the ileum relative to the caecum. This will clarify whether there are tissue-specific effects as we have seen previously and whether the metabolic differences are specific to the ileum and/or cytokine responses are specific to the caecum.
+
+## Comparing cell types
+
+```{r compare immune cell types, echo = FALSE, message = FALSE}
+
+ileum_cd4 <- readRDS("export.dir/Immune/ileum_cd4_memory.Rds")
+Idents(ileum_cd4) <- "Ileum"
+caecum_cd4 <- readRDS("export.dir/Immune/caecum_cd4_memory.Rds")
+Idents(caecum_cd4) <- "Caecum"
+
+all_cd4 <- merge(ileum_cd4, caecum_cd4)
+
+# Remove cells that express JCHAIN
+all_cd4 <- subset(all_cd4, subset = JCHAIN < 1)
+
+# get strict on mitochondrial reads
+#all_cd4 <- subset(all_cd4, subset = percent.mt < 5)
+
+# recluster etc
+all_cd4 <- ScaleData(all_cd4,
+                     features = rownames(all_cd4))
+
+all_cd4 <- FindVariableFeatures(all_cd4,
+                                selection.method = "vst",
+                                nfeatures = 2000)
+
+all_cd4 <- RunPCA(all_cd4,
+                  features = VariableFeatures(object = all_cd4))
+
+# harmony integration: by individual = orig.ident
+all_cd4 <- all_cd4 %>% 
+RunHarmony("orig.ident", plot_convergence = TRUE)
+all_cd4 <- FindNeighbors(all_cd4,
+                         reduction="harmony",
+                         dims = 1:30)
+all_cd4 <- RunUMAP(all_cd4,
+                   dims = 1:30,
+                   reduction = "harmony")
+
+tissue_colors <- c(c(blues9[4], blues9[8]))
+names(tissue_colors) <- c("Ileum", "Caecum")
+
+dplot_compare <- DimPlot(all_cd4, reduction = "pca") +
+  scale_color_manual(values = tissue_colors) 
+  
+dplot_compare
+
+ggsave(dplot_compare + theme(legend.position = "none"),
+       file = "export.dir/Comparison/cd4_tissue_compare_pca.pdf",
+       height = 5, width = 5)
+
+```
+
+## OXPHOS genes
+
+
+```{r tissue specific genes, echo = FALSE, message = FALSE}
+
+agg_cd4 <- as.data.frame(AggregateExpression(all_cd4, group.by = "orig.ident"))
+
+colnames(agg_cd4) <- gsub("RNA\\.", "", colnames(agg_cd4))
+
+all_cd4$tissue <- Idents(all_cd4)
+
+agg_meta <- distinct(data.frame(sample = all_cd4@meta.data$orig.ident,
+                                tissue = all_cd4@meta.data$tissue))
+
+
+rownames(agg_meta) <- gsub("-", "\\.", agg_meta$sample)
+agg_meta <- agg_meta[colnames(agg_cd4),]
+
+## DESeq analysis between tissues
+agg_meta <- agg_meta[colnames(agg_cd4),]
+dds_agg <- DESeqDataSetFromMatrix(agg_cd4,
+                                  colData = agg_meta,
+                                  design = ~tissue)
+colData(dds_agg)$tissue <- relevel(colData(dds_agg)$tissue, ref = "Ileum")
+
+dds_agg <- DESeq(dds_agg)
+agg_res <- lfcShrink(dds_agg,
+                     contrast = c("tissue", "Ileum", "Caecum"),
+                     res = results(dds_agg),
+                     type = "normal")
+
+# OXPHOS genes etc
+pathways <- gmtPathways("~/mirror/msigdb/msigdb_v7.1/msigdb_v7.1_GMTs/c5.bp.v7.1.symbols.gmt")
+
+oxphos <- pathways[["GO_OXIDATIVE_PHOSPHORYLATION"]]
+
+# just get the oxhos genes that are in the leading edge part of the 
+# cd4 cells
+oxphos_leading <- read.csv("export.dir/oxphos_leading_edge.tsv", sep = "\t", header = TRUE)$oxphos_leading
+
+# and those that are significantly different between tissues
+#sig_tissue <- rownames(agg_res[agg_res$padj < 0.05 & !is.na(agg_res$padj) & abs(agg_res$log2FoldChange) > 1,])
+#oxphos_leading <- intersect(oxphos_leading, sig_tissue)
+
+volcano_plot_2 <- function(x, use="padj", value=0.05, labels = NULL){
+  
+  if (is.null(labels)){
+    x$label <- ifelse(x[,use] < value &!(is.na(x[,use])), rownames(x), NA)
+  }else{
+    x$label <- ifelse(rownames(x) %in% labels, rownames(x), NA)
+  }
+  
+  x$color <- ifelse(x[,use] < value &!(is.na(x[,use])) & x$log2FoldChange > 1, "Ileum", NA)
+  x$color <- ifelse(x[,use] < value &!(is.na(x[,use])) & x$log2FoldChange < -1, "Caecum", x$color)
+  ggplot(x, aes(x=log2FoldChange, y = -log10(pvalue), color=color)) +
+    geom_point(size = 1, alpha = 0.5) +
+    geom_vline(xintercept=c(-1,1), linetype = "dashed") +
+    ggrepel::geom_text_repel(label = x$label, max.overlaps=100, color = "black") +
+    theme_classic() +
+    scale_color_manual(values = c(tissue_colors)) 
+}
+
+vplot <- volcano_plot_2(agg_res, labels = oxphos_leading) +
+  theme(legend.position = "none")
+
+ggsave(vplot, file = "export.dir/Comparison/cd4_volcano_caecum_ileum.pdf", height = 5, width = 5)
+
+vplot
+```
+
+
+```{r Ig expression, echo = FALSE, message = FALSE}
+
+FeaturePlot(all_cd4, features = c("JCHAIN", "MS4A1", "CD79A"), split.by = "tissue")
+
+
+```
+
+
+## Comparison of results
+
+Here we plot the fold changes in PSC-UC vs HC in each tissue for each gene and annotate those that are to do with OXPHOS and cytokine production.
+
+
+### Number of significant changes in each tissue
+
+```{r numbers and overlaps, echo = FALSE, message = FALSE}
+
+ileum_res <- read.csv("export.dir/ileum_cd4_mem_pscuc_vs_healthy.tsv",
+                      header = TRUE,
+                      stringsAsFactors = FALSE,
+                      sep = "\t",
+                      row.names = 1)
+
+caecum_res <- read.csv("export.dir/caecum_cd4_mem_pscus_vs_healthy.tsv",
+                      header = TRUE,
+                      stringsAsFactors = FALSE,
+                      sep = "\t",
+                      row.names = 1)
+
+# what is the overlap of tested genes
+tested_overlap <- list("Ileum" = rownames(ileum_res),
+                       "Caecum" = rownames(caecum_res))
+v_tested <- VennDiagram::venn.diagram(tested_overlap,
+                                      filename = NULL,
+                                      fill = c(blues9[3], blues9[8]),
+                                      alpha = 0.6)
+grid.draw(v_tested)
+pdf("export.dir/Comparison/immune_compare_tested_venn.pdf", height = 5, width = 5)
+grid.draw(v_tested)
+dev.off()
+
+# subset for significant - use later
+ileum_sig <- subset(ileum_res, subset = padj < 0.05)
+caecum_sig <- subset(caecum_res, subset = padj < 0.05)
+
+
+```
+
+
+### Functions associated with ileum-only genes
+
+```{r functions in ileum genes, echo = FALSE, message = FALSE}
+
+pathways <- gmtPathways("~/mirror/msigdb/msigdb_v7.1/msigdb_v7.1_GMTs/c5.bp.v7.1.symbols.gmt")
+
+ileum_specific <- setdiff(rownames(ileum_res), rownames(caecum_res))
+background <- rownames(ileum_res)
+
+ileum_specific_pathways <- fgsea::fora(pathways, ileum_specific, universe = background)
+ileum_specific_pathways <- ileum_specific_pathways[order(ileum_specific_pathways$pad, decreasing = FALSE),]
+
+```
+
+Lipid metabolic pathways and lipprotein assembly etc - to be expected but useful information nevertheless.
+
+
+## fgsea of OXPHOS in the caecum
+
+As we have seen that CD4 memory T cells are quite similar in the ileum and caecum albeit with more lipid metabolic processes ocurring in the ileum, I want to see if there is also an enrichment for OXPHOS in CD4 memory T cells in the caecum as we saw in the ileum.
+
+```{r fgsea caecum, echo = FALSE, message = FALSE}
+
+oxphos <- list("GO_OXIDATIVE_PHOSPHORYLATION" = pathways[["GO_OXIDATIVE_PHOSPHORYLATION"]])
+genes <- caecum_res$log2FoldChange
+names(genes) <- rownames(caecum_res)
+
+fgsea_oxphos_caecum <- fgsea(oxphos, genes)
+
+fgsea::plotEnrichment(pathways[["GO_OXIDATIVE_PHOSPHORYLATION"]], genes) +
+  geom_line(aes(x = rank, y = ES), color = blues9[8], linewidth = 1) +
+  theme_classic()
+
+ggsave("export.dir/Comparison/fgsea_oxphos_caecum.pdf", height = 5, width = 5)
+
+```
+
+
+```{r fgsea ileum, echo = FALSE, message = FALSE}
+
+ileum_genes <- ileum_res$log2FoldChange
+names(ileum_genes) <- rownames(ileum_res)
+
+fgsea_oxphos_ileum <- fgsea(oxphos, ileum_genes)
+
+# Get the shared leading edge genes
+shared_leading_edge <- intersect(unlist(fgsea_oxphos_ileum$leadingEdge),
+                                 unlist(fgsea_oxphos_caecum$leadingEdge))
+
+
+# Heatmap the shared leading edge genes
+
+vst_cd4_all <- assay(vst(dds_agg))
+
+row_annotation <- data.frame(gene = shared_leading_edge)
+row_annotation$type <- "OXPHOS"
+
+
+# Should scale and heatmap ileum and caecum 
+# separately
+metadata <- read.csv("/well/powrie/projects/proj072/analysis/GEX/05_cellranger_pipeline/samples.tsv",
+                     header=TRUE,
+                     stringsAsFactors = FALSE,
+                     sep="\t",
+                     row.names=2)
+rownames(metadata) <- gsub("-", "\\.", rownames(metadata))
+
+
+ileum_samples <- intersect(rownames(metadata[metadata$tissue == "Ileum",]),
+                           colnames(vst_cd4_all))
+caecum_samples <- intersect(rownames(metadata[metadata$tissue == "Caecum",]),
+                           colnames(vst_cd4_all))
+
+vst_cd4_ileum <- vst_cd4_all[,ileum_samples]
+vst_cd4_caecum <- vst_cd4_all[,caecum_samples]
+
+vst_cd4_ileum_s <- ScaleData(vst_cd4_ileum)
+vst_cd4_caecum_s <- ScaleData(vst_cd4_caecum)
+
+# separate Heatmaps
+
+meta_caecum <- metadata[colnames(vst_cd4_caecum_s),]
+meta_ileum <- metadata[colnames(vst_cd4_ileum_s),]
+meta_caecum$disease_type <- factor(meta_caecum$disease_type, levels = c("HC", "UC", "PSCUC"))
+meta_ileum$disease_type <- factor(meta_ileum$disease_type, levels = c("HC", "UC", "PSCUC"))
+
+
+column_anno_il <- HeatmapAnnotation(
+  disease = meta_ileum$disease_type,
+  col = list(disease = c("UC" = group_colors[[1]],
+                         "PSCUC" = group_colors[[2]],
+                         "HC" = group_colors[[3]])))
+
+h_ileum <- Heatmap(vst_cd4_ileum_s[shared_leading_edge,],
+           column_split = meta_ileum$disease_type,
+           cluster_columns = FALSE,
+           show_column_names = FALSE,
+           top_annotation = column_anno_il,
+           row_names_gp = gpar(fontsize = 6),
+           rect_gp = gpar(col = "white", lwd = 0.5))
+
+column_anno_cae <- HeatmapAnnotation(
+  disease = meta_caecum$disease_type,
+  col = list(disease = c("UC" = group_colors[[1]],
+                         "PSCUC" = group_colors[[2]],
+                         "HC" = group_colors[[3]])))
+
+h_caecum <- Heatmap(vst_cd4_caecum_s[shared_leading_edge,],
+            column_split = meta_caecum$disease_type,
+            cluster_columns = FALSE,
+            show_column_names = FALSE,
+            top_annotation = column_anno_cae,
+            row_names_gp = gpar(fontsize = 6),
+            rect_gp = gpar(col = "white", lwd = 0.5))
+pdf("export.dir/Comparison/caecum_ileum_cd4_oxphos_heatmap.pdf", height = 5, width = 5)
+h_ileum + h_caecum
+dev.off()
+
+
+
+# Exploring Nuclear genome encoded components
+nuclear_cytochrome <- c("COX5A",
+                        "COX5B",
+                        "COX6C",
+                        "COX7C",
+                        "COX4A",
+                        "COX6B",
+                        "COX7B",
+                        "COX6A",
+                        "COX7A",
+                        "COX8A",
+                        "NDUFA4")
+nuclear_leading <- intersect(nuclear_cytochrome, shared_leading_edge)
+
+featurebox(as.data.frame(vst_cd4_caecum),
+           metadata[colnames(vst_cd4_caecum),],
+           features = c("IL17A", "IL23R"),
+           group_by = "disease_type") +
+  facet_wrap(~feature,scales = "free")
+
+
+```
+
+
+```{r comparison, echo = FALSE, message = FALSE}
+
+oxphos <- pathways[["GO_OXIDATIVE_PHOSPHORYLATION"]]
+cytokines <- pathways[["GO_CYTOKINE_PRODUCTION"]]
+
+
+caecum_res <- caecum_res[order(caecum_res$padj, decreasing = FALSE),]
+
+shared_genes <- intersect(rownames(caecum_res), rownames(ileum_res))
+
+comparison_set <- data.frame("Caecum" = caecum_res[shared_genes,]$log2FoldChange,
+                             "Ileum" = ileum_res[shared_genes,]$log2FoldChange,
+                             "Gene" = shared_genes)
+
+comparison_set$type <- ifelse(comparison_set$Gene %in% shared_leading_edge, "OXPHOS", NA)
+
+comparison_set$label <- ifelse(comparison_set$type == "OXPHOS", comparison_set$Gene, NA)
+
+ggplot(comparison_set, aes(x = Ileum, y = Caecum, color = type)) +
+  geom_point(size = 0.3) +
+  theme_classic() +
+  geom_hline(yintercept = c(-0.5,0.5, 0), linetype = "dashed") +
+  geom_vline(xintercept = c(-0.5,0.5, 0), linetype = "dashed") +
+  ylim(c(-3,3))  +
+  ggrepel::geom_text_repel(label = comparison_set$label) +
+  stat_smooth(method = "lm") +
+  ggpubr::stat_cor() +
+  geom_abline(slope = 1)
+
+
+```
+
+
+# IgA plasma cells
+
+Here we just do a quick comparison of IgA plasma cells between the tissues. The main focus of the paper is not on this cell type.
+
+```{r plasma cells compare, echo = FALSE, message = FALSE}
+
+pileum <- read.csv("export.dir/Immune/ileum_proportions.tsv",
+                   header = TRUE,
+                   stringsAsFactors = FALSE,
+                   sep = "\t")
+
+pileum$tissue <- "Ileum"
+
+pcaecum <- read.csv("export.dir/Immune/caecum_proportions.tsv",
+                   header = TRUE,
+                   stringsAsFactors = FALSE,
+                   sep = "\t")
+
+pcaecum$tissue <- "Caecum"
+
+pcells <- bind_rows(pileum, pcaecum)
+pcells <- pcells[pcells$cluster == "Plasma_Cell_IgA",]
+ggplot(pcells, aes(x = tissue, y = prop, fill = tissue)) +
+  geom_bar(stat = "identity", position = "dodge") + 
+  scale_fill_manual(values = tissue_colors) +
+  theme_classic()
+
+ggsave("export.dir/Comparison/IgA_pcells.pdf", height = 3, width = 3)
+
+```
+
+
+
+
+
+

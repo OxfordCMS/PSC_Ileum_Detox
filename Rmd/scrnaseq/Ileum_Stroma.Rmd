@@ -1,0 +1,269 @@
+---
+title: "Ileum stroma/endothelium analysis: Forced cells 10000"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(dev.args=list(png=list(type="cairo")))
+options(bitmapType = "cairo")
+knitr::opts_knit$set(root.dir="/well/powrie/users/utu691/work/proj072/analysis/final_analysis")
+
+# reticulate stuff
+reticulate::use_virtualenv('~/devel/venv/Python-3.10.8-GCCcore-12.2.0/skylake/', required=TRUE)
+```
+
+```{r load libraries, echo=FALSE, message=FALSE}
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+source("~/devel/proj060/code/R/gex_helper.R")
+source("scfunctions.R")
+library(RColorBrewer)
+library(fgsea)
+library(futile.logger)
+library(harmony)
+library(speckle)
+library(scWGCNA)
+library(circlize)
+library(ggraph)
+library(igraph)
+library(DESeq2)
+
+
+# create Clustering analysis dir
+if (!(dir.exists("export.dir/Stroma"))){
+  dir.create("export.dir/Stroma")
+}
+```
+
+
+```{r set colors, echo=FALSE, message=FALSE, warning=FALSE}
+
+group_colors <- list("UC" = "red3", "PSCUC" = blues9[6], "HC" = "grey")
+
+```
+
+
+# Overview
+
+We will need to organise data analysis by cell types. There are some that will not have enough cells to perform pseudobulk for example but we can determine this as we go along. In this doc I am going to look at the stromal/endothelial compartment. Part of the analysis will be to understand a bit more about genes that we saw in bulk RNA-seq so am very interested in glutahione metabolism and oxidative stress responses.
+
+```{r read data merged ileum, echo=FALSE, message=FALSE}
+
+merged_ileum <- readRDS("export.dir/Clustering/ileum_harmonised_force_cells_annotated.Rds")
+
+# read in metadata
+metadata <- read.csv("/well/powrie/projects/proj072/analysis/GEX/05_cellranger_pipeline/samples.tsv",
+                     header=TRUE,
+                     stringsAsFactors = FALSE,
+                     sep="\t",
+                     row.names=2)
+```
+
+
+```{r subset for stromal cells, echo=FALSE, message=FALSE}
+
+stroma <- subset(merged_ileum, idents = c("Stroma",
+                                          "Stroma_2",
+                                          "Endothelium",
+                                          "Endothelium_Lymphatic"))
+
+
+```
+
+## Re-clustering of stromal cells {.tabset .tabset-pills}
+
+Here we recluster just the stromal cells.
+
+```{r recluster stroma, echo=FALSE, message=FALSE}
+
+# high mitochondiral cells removal
+stroma <- subset(stroma, subset = percent.mt < 10)
+
+# recluster etc
+stroma <- ScaleData(stroma, features = rownames(stroma))
+stroma <- FindVariableFeatures(stroma, selection.method = "vst", nfeatures = 2000)
+stroma <- RunPCA(stroma, features = VariableFeatures(object = stroma))
+
+# harmony integration: by individual = orig.ident
+stroma <- stroma %>% 
+RunHarmony("orig.ident", plot_convergence = TRUE)
+stroma <- FindNeighbors(stroma, reduction="harmony", dims = 1:30)
+stroma <- FindClusters(stroma, resolution = 0.1, algorithm = 4)
+stroma <- RunUMAP(stroma, dims = 1:30, reduction = "harmony")
+```
+
+### UMAP
+
+```{r epitheilum umap, echo=FALSE, message=FALSE}
+
+DimPlot(stroma, label=TRUE, reduction = "umap")
+
+```
+
+
+
+### Dotplot of markers
+
+```{r dotplot epithelium, echo=FALSE, message=FALSE}
+
+# find markers for exploration
+stroma <- JoinLayers(stroma)
+stromal_markers <- FindAllMarkers(stroma, only.pos = TRUE)
+
+stromal_genes <- c("PDPN",
+                   "PDGFRA",
+                   "PDGFRB",
+                   "NOTCH4",
+                   "FAP",
+                   "FLT1",
+                   "CALD1",
+                   "IGFBP7",
+                   "PECAM1",
+                   "PHGR1",
+                   "THY1",
+                   "LYVE1",
+                   "ACKR1",
+                   "CDH5",
+                   "COL1A1",
+                   "COL1A2",
+                   "CD74",
+                   "ADAMDEC1",
+                   "ADAM28",
+                   "IL6",
+                   "IGHV4-28",
+                   "MYH11",
+                   "NRXN1",
+                   "BCAT1",
+                   "F3")
+
+dplot_stroma <- DotPlot(stroma,
+             cols = colorRampPalette(c("blue", "red"))(2),
+             features=stromal_genes,
+             cluster.idents = TRUE) +
+             theme(axis.text.x = element_text(angle=45, hjust=1)) 
+
+dplot_stroma
+
+```
+
+```{r filter out off clusters, echo=FALSE, message=FALSE}
+
+## get rid of cluster 2 and 4
+stroma <- subset(stroma, ident = 4, invert = TRUE)
+stroma <- subset(stroma, ident = 3, invert = TRUE)
+
+dplot_stroma <- DotPlot(stroma,
+             cols = colorRampPalette(c("blue", "red"))(2),
+             features=stromal_genes,
+             cluster.idents = TRUE) +
+             theme(axis.text.x = element_text(angle=45, hjust=1)) 
+
+dplot_stroma
+
+```
+
+## Annotation
+
+The main thing here is to pick out the most relevant populations. If there are some that seem sketchy then they will be removed and we will only keep those that have robust markers associated with them. I have removed clusters 3 and 4 as it has Ig marker genes and likely is contaminated cluster.
+
+```{r annotation stroma, echo=FALSE, message=FALSE}
+
+# annotations
+annotations_stroma <- c("Endothelium",
+                        "Fibroblast_ADAMDEC1",
+                        "Endothelium_NRXN1",
+                        "Endothelium_Lymphatic",
+                        "Fibroblast_F3")
+
+names(annotations_stroma) <- levels(stroma)
+stroma <- RenameIdents(stroma, annotations_stroma)
+
+
+annotation_colors_stroma <- OCMSutility::get_palette(n = 50)[40:45]
+names(annotation_colors_stroma) <- unique(Idents(stroma))
+
+# save the colors
+saveRDS(annotation_colors_stroma, file="export.dir/Clustering/stroma_cell_colors.Rds")
+
+dimplot_stroma <- DimPlot(stroma, label = TRUE, repel = TRUE) + 
+  scale_color_manual(values = annotation_colors_stroma) +
+  ggtitle(paste0("No. cells = ", nrow(stroma@meta.data)))
+
+dimplot_stroma
+
+# write out  annotated clusters
+
+# Figure 1D
+ggsave(dimplot_stroma + theme(legend.position = "none"), file = "export.dir/Figures/Stroma_umap.pdf", height=5, width=5)
+
+saveRDS(stroma, file = "export.dir/Clustering/ileum_stroma_clusters_annotated.Rds")
+
+dplot_stroma <- DotPlot(stroma,
+             cols = colorRampPalette(c("blue", "red"))(2),
+             features=stromal_genes,
+             cluster.idents = TRUE) +
+             theme(axis.text.x = element_text(angle=45, hjust=1)) 
+
+dplot_stroma
+
+if (!dir.exists("export.dir/Stroma")){
+  dir.create("export.dir/Stroma")
+}
+ggsave(file = "export.dir/Stroma/stroma_dotplot.pdf", height = 3, width = 15)
+
+```
+
+### Profile of stroma subsets across individuals
+
+This is just to show the profiles of these cell types across individuals.
+
+```{stroma proportions, echo=FALSE, message=FALSE}
+
+ind_props_stroma <- plot_props(stroma, metadata, annotation_colors_stroma) +
+  theme(axis.text.x = element_blank()) +
+  theme(axis.text.x = element_blank(), legend.position = "bottom")
+
+ggsave(ind_props_stroma, file = "export.dir/Figures/stromal_cells_profile.pdf", height=3, width = 6)
+
+ind_props_stroma
+
+```
+
+There aren't many stromal cells per individual so we may not take these forward for any analysis. Below is a table of the number of cells per cell type.
+
+
+```{r ncells per individual, echo=FALSE, message=FALSE}
+
+
+
+
+```
+
+
+```{r echo=FALSE, message=FALSE}
+data.frame(table(stroma@meta.data$orig.ident, stroma@meta.data$seurat_clusters))
+```
+
+
+## Score cell cycle
+
+```{r cell cycle, echo=FALSE, message=FALSE}
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+stroma <- CellCycleScoring(stroma, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+
+DimPlot(stroma)
+Idents(stroma) <- stroma@meta.data$seurat_clusters
+```
+
+Proliferating cells will be the TA so will not regress out actually.
+
+
+

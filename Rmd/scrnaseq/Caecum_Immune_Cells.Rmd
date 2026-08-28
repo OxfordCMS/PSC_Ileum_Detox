@@ -1,0 +1,986 @@
+---
+title: "Caecum immune cell analysis: Forced cells 10000"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo=FALSE}
+
+# temporary solution to libpaths
+.libPaths("~/R/x86_64-pc-linux-gnu-library/4.3/")
+
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(dev.args=list(png=list(type="cairo")))
+options(bitmapType = "cairo")
+
+# reticulate stuff
+reticulate::use_virtualenv('~/devel/venv/Python-3.10.8-GCCcore-12.2.0/skylake/', required=TRUE)
+knitr::opts_knit$set(root.dir="/well/powrie/users/utu691/work/proj072/analysis/final_analysis")
+
+```
+
+```{r load libraries, echo=FALSE, message=FALSE}
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+source("~/devel/proj060/code/R/gex_helper.R")
+source("~/devel/proj072/R/scfunctions.R")
+library(RColorBrewer)
+library(fgsea)
+library(futile.logger)
+library(harmony)
+library(speckle)
+library(scWGCNA)
+library(circlize)
+library(ggraph)
+library(igraph)
+library(DESeq2)
+library(nVennR)
+
+
+# create Clustering analysis dir
+if (!(dir.exists("export.dir/Immune"))){
+  dir.create("export.dir/Immune")
+}
+```
+
+
+```{r set colors, echo=FALSE, message=FALSE, warning=FALSE}
+
+group_colors <- list("UC" = "red3", "PSCUC" = blues9[6], "HC" = "grey")
+
+```
+
+
+```{r read in pathways, echo=FALSE, message=FALSE}
+
+pathways <- gmtPathways("~/mirror/msigdb/msigdb_v7.1/msigdb_v7.1_GMTs/c5.bp.v7.1.symbols.gmt")
+
+```
+
+
+## Cluster all immune cells
+
+Here we re-cluster all the immune cells. 
+
+```{r cluster immune cells, echo=FALSE, message=FALSE}
+
+# setting seed for all clustering/umappy things
+set.seed(10)
+
+# Read in data
+merged_caecum <- readRDS("export.dir/Clustering/caecum_harmonised_force_cells_annotated.Rds")
+
+unique(Idents(merged_caecum))
+
+immune_cells <- subset(merged_caecum, idents = c("T_Cell_Undetermined",
+                                                 "CD4_T_Cell",
+                                                 "CD8_T_Cell",
+                                                 "B_Cell",
+                                                "Gamma_Delta_T_Cell",
+                                                "Mast_Cell",
+                                                "Mono_Mac",
+                                                "Mono_Mac_Inf",
+                                                "B_Cell_IgA"))
+
+# take out high mt genes now
+immune_cells <- subset(immune_cells, subset = percent.mt < 10)
+
+# recluster etc
+immune_cells <- ScaleData(immune_cells, features = rownames(immune_cells))
+immune_cells <- FindVariableFeatures(immune_cells, selection.method = "vst", nfeatures = 2000)
+immune_cells <- RunPCA(immune_cells, features = VariableFeatures(object = immune_cells))
+
+# harmony integration: by individual = orig.ident
+immune_cells <- immune_cells %>% 
+RunHarmony("orig.ident", plot_convergence = TRUE)
+immune_cells <- FindNeighbors(immune_cells, reduction="harmony", dims = 1:30)
+immune_cells <- FindClusters(immune_cells, resolution = 0.6, algorithm = 4)
+immune_cells <- RunUMAP(immune_cells, dims = 1:30, reduction = "harmony")
+
+```
+
+## Cell cycle markers
+
+```{r cell cycle markers, echo=FALSE, message =FALSE}
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+immune_cells <- JoinLayers(immune_cells)
+
+immune_cells <- CellCycleScoring(immune_cells, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+
+DimPlot(immune_cells, label = TRUE)
+Idents(immune_cells) <- immune_cells@meta.data$seurat_clusters
+
+
+```
+
+
+## Find markers and annotate
+
+### Dimplot
+
+```{r find markers immune, echo=FALSE, message=FALSE}
+markers_immune_cells <- FindAllMarkers(immune_cells, only.pos = TRUE)
+
+DimPlot(immune_cells, label=TRUE, reduction = "umap") +
+  ggtitle(paste0("No. cells = ", nrow(immune_cells@meta.data)))
+
+```
+
+```{r immune cell marker genes, echo=FALSE, message=FALSE, fig.width=11}
+
+t_cell_genes <- c("PTPRC",
+                  "CD3D",
+                  "CD4",
+                  "TRDC",
+                  "CD8A",
+                  "RORC",
+                  "SELL",
+                  "IL7R",
+                  "CD2",
+                  "S100A4",
+                  "CCR7",
+                  "Il22",
+                  "IL23R",
+                  "KLF2",
+                  "FOXP3",
+                  "CD69",
+                  "CTLA4",
+                  "IL2RA",
+                  "IKZF2",
+                  "TNFRSF18",
+                  "LAG3",
+                  "IL17A",
+                  "IFNG",
+                  "TNF",
+                  "CXCR3",
+                  "CCR5",
+                  "GZMA",
+                  "GZMK",
+                  "TWIST1")
+
+b_cell_genes <- c("CD19",
+                  "CD79A",
+                  "CD27",
+                  "MZB1",
+                  "IGHA1",
+                  "IGHA2",
+                  "IGHG1",
+                  "IGHG2",
+                  "IGHD",
+                  "CCL3",
+                  "CCL4",
+                  "MEF2B",
+                  "CXCR4",
+                  "CD83",
+                  "MS4A1",
+                  "BANK1")
+
+
+mono_mac_genes <- c("CD68",
+                    "CD14",
+                    "CD74",
+                    "HLA-DRA",
+                    "S100A8",
+                    "S100A9",
+                    "IL1B",
+                    "TCF4",
+                    "C1QA",
+                    "LAMP3")
+
+mast_cell_genes <- c( "KIT",
+                     "FCER1A")
+
+
+DotPlot(immune_cells, features = c(t_cell_genes, b_cell_genes, mono_mac_genes, mast_cell_genes, "MKI67", "ITGAX"),
+        cols = colorRampPalette(c("blue", "red"))(2),
+        cluster.idents = TRUE) +
+  theme(axis.text.x = element_text(angle=45, hjust=1)) 
+```
+
+
+```{r annotated immune clusters, echo=FALSE, message=FALSE}
+
+immune_cell_annotations <- c("Plasma_Cell_IgA",
+                             "CD4_Memory",
+                             "B_Cell_Memory_IgD",
+                             "CD8_Memory",
+                             "Treg",
+                             "Gamma_Delta_T_Cell",
+                             "B_Cell_Memory",
+                             "Mono_Mac",
+                             "Plasma_Cell_IgA",
+                             "Ribosomal_Hi",
+                             "CD8_T_Cell_GMZK",
+                             "cDC",
+                             "Gamma_Delta_T_Cell_KLRF1",
+                             "Mast_Cell"
+                             )
+                             
+names(immune_cell_annotations) <- levels(Idents(immune_cells))
+immune_cells <- RenameIdents(immune_cells, immune_cell_annotations)
+
+immune_cells <- subset(immune_cells, idents = c("Ribosomal_Hi"), invert=TRUE)
+immune_cell_anno_colors <- OCMSutility::get_palette(n = 100)[53:66]
+names(immune_cell_anno_colors) <- as.character(levels(Idents(immune_cells)))
+
+# remove dodgy sample that has the enterocyte high proportion. 
+immune_cells <- subset(immune_cells, subset = orig.ident == "G-SCI7T094-SCI5T094", invert = TRUE)
+
+# save the colors
+saveRDS(immune_cell_anno_colors, file="export.dir/Clustering/immune_cell_colors_caecum.Rds")
+
+dimplot_immune <- DimPlot(immune_cells, label = TRUE, repel = TRUE) +
+  theme(legend.position = "none") +
+  scale_color_manual(values = immune_cell_anno_colors) +
+  ggtitle(paste0("No. cells = ", nrow(immune_cells@meta.data)))
+
+dimplot_immune 
+  
+# Figure 1
+ggsave(dimplot_immune, file = "export.dir/Figures/Immune_umap_caecum.pdf", height=5, width=5)
+
+saveRDS(immune_cells, file = "export.dir/Clustering/caecum_immune_clusters_annotated.Rds")
+
+```
+
+
+## DotPlot with annotations
+
+This is to show how we annotated the immune cell clusters.
+
+```{r dotplot with annotations, echo=FALSE, message=FALSE}
+
+dotplot_immune <- DotPlot(immune_cells, features = c(t_cell_genes, b_cell_genes, mono_mac_genes, mast_cell_genes),
+        cols = colorRampPalette(c("blue", "red"))(2),
+        cluster.idents = TRUE) +
+  theme(axis.text.x = element_text(angle=45, hjust=1)) 
+
+dotplot_immune
+
+```
+
+## Proportion of immune cells across samples
+
+```{r proportion immune cells, echo = FALSE, message = FALSE}
+
+# read in metadata
+metadata <- read.csv("/well/powrie/projects/proj072/analysis/GEX/05_cellranger_pipeline/samples.tsv",
+                     header=TRUE,
+                     stringsAsFactors = FALSE,
+                     sep="\t",
+                     row.names=2)
+
+
+rownames(metadata) <- gsub("\\.", "-", rownames(metadata))
+immune_props_plt <- plot_props(immune_cells, metadata, immune_cell_anno_colors) +
+  theme(axis.text.x = element_blank(), legend.position = "bottom")
+
+# Figure 3
+ggsave(immune_props_plt, file = "export.dir/Figures/immune_cells_profile_caecum.pdf", height=3, width = 5)
+
+immune_props_plt
+
+immune_cells@meta.data$annotation <- Idents(immune_cells)
+```
+
+```{r ncells immune, echo=FALSE, message=FALSE}
+
+clusters <- unique(Idents(immune_cells))
+ncells_cluster = list()
+ninds_cluster = list()
+
+for (i in 1:length(clusters)){
+  flog.info(paste0("Counting cells for cluster ", clusters[i]))
+  dat <- subset(immune_cells, idents = clusters[i])
+  n <- ncol(dat)
+  nind <- length(unique(as.character(dat@meta.data$orig.ident)))
+  ncells_cluster[[i]] <- n
+  ninds_cluster[[i]] <- nind
+}
+names(ncells_cluster) <- clusters
+
+ncells_cluster <- as.data.frame(t(as.data.frame(ncells_cluster)))
+
+ncells_cluster$cluster <- gsub("X", "", rownames(ncells_cluster))
+colnames(ncells_cluster) <- c("ncells", "cluster")
+
+# order by cluster size
+ncells_cluster <- ncells_cluster[order(ncells_cluster$ncells, decreasing = FALSE),]
+ncells_cluster$cluster <- factor(ncells_cluster$cluster, levels = ncells_cluster$cluster)
+
+ncells_cluster$prop <- (ncells_cluster$ncells/4834)*100
+knitr::kable(ncells_cluster)
+
+write.table(ncells_cluster,
+            file = "export.dir/Immune/caecum_proportions.tsv",
+            sep = "\t",
+            quote = FALSE,
+            row.names = FALSE)
+```
+
+## Compare proportions of immune cell clusters
+
+Here we use propeller to see of there are any significant differences in immune cell popoulations between the disease groups.
+
+
+```{r props immune cells, echo=FALSE, message=FALSE}
+
+annos_immune <- immune_cells@meta.data
+annos_immune$annotation <- Idents(immune_cells)
+
+annos_immune <- annos_immune %>% 
+  group_by(orig.ident, annotation) %>%
+  summarize(n = n())
+
+annos_immune$disease_type <- metadata[annos_immune$orig.ident,]$disease_type
+
+annos_immune_prop <- annos_immune %>% 
+  mutate(prop = (n/sum(n))*100)
+
+comparisons <- list(c(1,2), c(1,3), c(2,3))
+annos_immune_prop <- annos_immune_prop[!is.na(annos_immune_prop$annotation),]
+ggplot(annos_immune_prop, aes(x=disease_type, y=prop, color=annotation)) +
+  geom_boxplot(outlier.alpha = 0, fill = "white") +
+  geom_jitter(width=0.1, height=0) +
+  theme_classic() +
+  facet_wrap(~annotation, scales="free", nrow = 3) +
+  ggpubr::stat_compare_means(comparisons = comparisons, size=3) +
+  scale_color_manual(values = immune_cell_anno_colors) +
+  theme(legend.position = "none")
+
+prop_list_immune <- getTransformedProps(clusters = Idents(immune_cells),
+                                 sample = immune_cells@meta.data$orig.ident)
+
+metadata_immune <- metadata[colnames(prop_list_immune[[1]]),]
+
+design_immune <- model.matrix(~0+disease_type, data = metadata_immune)
+
+res_comp_immune <- propeller.anova(prop_list_immune, design=design_immune, coef=c(1,2,3), robust=FALSE,
+  trend=FALSE, sort=TRUE)
+
+knitr::kable(res_comp_immune)
+
+```
+
+
+## Number of cells per person 
+
+Here we look at the number of cells in each individual to determine how well we can do pseudobulk.
+
+```{r n per individual immune cells, echo=FALSE, message=FALSE}
+
+ncells_per_sample_immune <- as.data.frame(table(immune_cells@meta.data$annotation,
+                                                immune_cells@meta.data$orig.ident))
+knitr::kable(ncells_per_sample_immune)
+
+# only analyse when there are at least 20 cells per indivudual
+ncells_per_sample_immune$disease_type <- metadata[as.character(ncells_per_sample_immune$Var2), ]$disease_type
+ggplot(ncells_per_sample_immune, aes(x=disease_type, y=Freq, color=disease_type)) +
+  geom_point() +
+  theme_classic() +
+  facet_wrap(~Var1, scales = "free") +
+  geom_hline(yintercept = 20,  linetype="dashed") +
+  theme(axis.text.x = element_blank()) +
+  scale_color_manual(values = group_colors) +
+ # ggpubr::stat_compare_means(comparisons = list(c(1,2), c(1,3), c(2,3))) +
+  ggrepel::geom_text_repel(label = ncells_per_sample_immune$Freq)
+
+
+```
+
+```{r ncells per person filter, echo=FALSE, message=FALSE}
+
+
+ncells_per_sample_immune %>%
+  group_by(Var2) %>%
+  summarize(sum = sum(Freq))
+```
+
+
+
+## CD4 memory pseudobulk
+
+```{r cd4 memory pseudobulk, echo=FALSE, message = FALSE}
+
+set.seed(10)
+
+cd4 <- subset(immune_cells, idents = "CD4_Memory")
+
+# Some oddities with CD8 and Ig in there so
+# recluster as there are some oddities with CD8 and Ig genes in here
+cd4 <- ScaleData(cd4, features = rownames(cd4))
+cd4 <- FindVariableFeatures(cd4, selection.method = "vst", nfeatures = 2000)
+cd4 <- RunPCA(cd4, features = VariableFeatures(object = cd4))
+
+# harmony integration: by individual = orig.ident
+cd4 <- cd4 %>% 
+RunHarmony("orig.ident", plot_convergence = TRUE)
+cd4 <- FindNeighbors(cd4, reduction="harmony", dims = 1:30)
+cd4 <- FindClusters(cd4, resolution = 1, algorithm = 4)
+cd4 <- RunUMAP(cd4, dims = 1:30, reduction = "harmony")
+
+cd4_markers <- FindAllMarkers(cd4, only.pos = TRUE)
+
+DimPlot(cd4, label=TRUE, reduction = "umap")
+
+DotPlot(cd4, features = c("CD8A", "CD4"))
+
+cd4 <- subset(cd4, idents = c(2,3,4))
+
+
+# Filter out those with fewer than 20 cells
+ncd4 <- ncells_per_sample_immune[ncells_per_sample_immune$Var1 == "CD4_Memory",] %>%
+  group_by(Var2) %>%
+  summarize(sum = sum(Freq))
+
+to_filter_cd4 <- ncd4[ncd4$sum < 20,]$Var2
+
+# filter
+cd4 <- subset(cd4, subset = orig.ident %in% to_filter_cd4, invert = TRUE)
+
+# aggregate and diff expression
+agg_cd4 <- AggregateExpression(cd4, group.by = c("orig.ident"))
+agg_cd4 <- as.data.frame(agg_cd4)
+colnames(agg_cd4) <- gsub("RNA\\.", "", colnames(agg_cd4))
+
+meta_cd4 <- metadata
+rownames(meta_cd4) <- gsub("-", "\\.", rownames(meta_cd4))
+coldata <- meta_cd4[colnames(agg_cd4),]
+
+dds_cd4 <- DESeqDataSetFromMatrix(agg_cd4, colData = coldata, design=~disease_type)
+dds_cd4$disease_type <- relevel(dds_cd4$disease_type, ref = "HC")
+dds_cd4 <- dds_cd4[rowSums(counts(dds_cd4) >= 10) >= 4,]
+dds_cd4 <- DESeq2::DESeq(dds_cd4)
+
+# lfc shrink
+res1 <- lfcShrink(dds_cd4,
+                  contrast = c("disease_type", "PSCUC", "HC"),
+                  res = results(dds_cd4, name = "disease_type_PSCUC_vs_HC"),
+                  type = "normal")
+
+res2 <- lfcShrink(dds_cd4,
+                  contrast = c("disease_type", "UC", "HC"),
+                  res = results(dds_cd4, name = "disease_type_UC_vs_HC"),
+                  type = "normal")
+
+genes_psc <- rownames(res1[res1$padj < 0.05 & !is.na(res1$padj),])
+genes_uc <- rownames(res2[res2$padj < 0.05 & !is.na(res2$padj),])
+
+cd4_memory_volc <- volcano_plot(res1, use="padj") +
+  ggtitle("PSC-UC vs. Healthy") +
+  scale_color_manual(values = immune_cell_anno_colors[[2]]) +
+  theme(legend.position = "none")
+
+cd4_memory_volc_uc <- volcano_plot(res2, use="padj") +
+  ggtitle("UC vs. Healthy") +
+  scale_color_manual(values = immune_cell_anno_colors[[2]]) +
+  theme(legend.position = "none")
+
+ggsave(cd4_memory_volc, file = "export.dir/Figures/cd4_memory_volcano_caecum.pdf", height = 3, width=3)
+
+cd4_memory_volc
+cd4_memory_volc_uc
+
+# write out results for comparison to ileum
+write.table(data.frame(gene = rownames(res1), res1),
+            file = "export.dir/caecum_cd4_mem_pscuc_vs_healthy.tsv",
+            quote = FALSE,
+            row.names = FALSE,
+            sep = "\t")
+
+# Write the cd4
+saveRDS(cd4, file = "export.dir/Immune/caecum_cd4_memory.Rds")
+```
+
+```{r table of diffences, echo=FALSE, message=FALSE}
+
+nup_psc <- nrow(res1[res1$padj < 0.05 & res1$log2FoldChange > 0 & !(is.na(res1$padj)),])
+nup_uc <- nrow(res2[res2$padj < 0.05 & res2$log2FoldChange > 0 & !(is.na(res2$padj)),])
+ndown_psc <- nrow(res1[res1$padj < 0.05 & res1$log2FoldChange < 0 & !(is.na(res1$padj)),])
+ndown_uc <- nrow(res2[res2$padj < 0.05 & res2$log2FoldChange < 0 & !(is.na(res2$padj)),])
+
+results_cd4 <- data.frame(comparison = resultsNames(dds_cd4)[2:3],
+                          no.up = c(nup_psc, nup_uc),
+                          no.down = c(ndown_psc, ndown_uc))
+
+knitr::kable(results_cd4)
+```
+
+
+## CD4 FGSEA
+
+
+```{r cd4 fgsea, echo=FALSE, message=FALSE}
+
+set.seed(10)
+
+cd4_genes <- res1$log2FoldChange
+names(cd4_genes) <- rownames(res1)
+
+# gene set enrichments
+cd4_fgsea <- fgsea::fgsea(pathways, cd4_genes, minSize=50)
+cd4_fgsea <- cd4_fgsea[order(cd4_fgsea$padj, decreasing = FALSE),]
+
+cd4_pathways_sig <- cd4_fgsea[cd4_fgsea$padj < 0.05,]
+
+cd4_top10 <- cd4_pathways_sig[1:10,]
+cd4_top10$pathway <- factor(cd4_top10$pathway, levels = cd4_top10$pathway)
+cd4_top10_p <- ggplot(cd4_top10, aes(x = pathway, y=NES, fill=-log10(padj))) +
+  geom_bar(stat="identity") +
+  scale_fill_gradient(low="snow2", high=immune_cell_anno_colors[[2]]) +
+  theme_classic() +
+  coord_flip()
+  
+ggsave(cd4_top10_p, file = "export.dir/Figures/cd4_memory_pathway_barplot_caecum.pdf", height=2.5, width=10)
+
+cd4_top10_p
+
+
+```
+
+## Genes in cytokine pathway
+
+```{r cytokines, echo = FALSE, message = FALSE}
+
+cd4_vst <- vst(dds_cd4)
+cd4_vst <- as.data.frame(assay(cd4_vst))
+
+gois_cytokine <- unlist(cd4_top10[cd4_top10$pathway == "GO_CYTOKINE_PRODUCTION",]$leadingEdge)
+
+
+disease_anno <- HeatmapAnnotation("Disease type" = coldata$disease_type,
+                                  col = list("Disease type" = c("HC" = "grey",
+                                                                "PSCUC" = blues9[6],
+                                                                "UC" = "red3")))
+
+heat_colors <- colorRamp2(breaks = c(-2,0,2), colors = c("blue3", "white", "red3"))
+
+cd4_vst_s <- ScaleData(cd4_vst)
+h1 <- Heatmap(cd4_vst_s[gois_cytokine,],
+              column_split = coldata$disease_type,
+              col = heat_colors,
+              cluster_columns = FALSE,
+              top_annotation = disease_anno,
+              show_column_names = FALSE,
+              rect_gp = gpar(col="white", lwd=0.5),
+              row_names_gp = gpar(fontsize=4), 
+              cluster_column_slices = TRUE)
+
+h1
+
+# Write out cd4 vst data
+write.table(data.frame(gene = rownames(cd4_vst), cd4_vst),
+            file = "export.dir/caecum_cd4_mem_vst.tsv",
+            row.names = FALSE,
+            quote = FALSE,
+            sep = "\t")
+
+```
+
+
+
+```{r cd4 in uc, echo=FALSE, message=FALSE}
+
+cd4_genes_uc <- res2$log2FoldChange
+names(cd4_genes_uc) <- rownames(res2)
+
+# gene set enrichments
+cd4_fgsea_uc <- fgsea::fgsea(pathways, cd4_genes_uc, minSize=50)
+cd4_fgsea_uc <- cd4_fgsea_uc[order(cd4_fgsea_uc$padj, decreasing = FALSE),]
+
+cd4_pathways_sig_uc <- cd4_fgsea_uc[cd4_fgsea_uc$padj < 0.05,]
+
+cd4_top10_uc <- cd4_pathways_sig_uc[1:10,]
+cd4_top10_uc$pathway <- factor(cd4_top10_uc$pathway, levels = cd4_top10_uc$pathway)
+cd4_top10_p_uc <- ggplot(cd4_top10_uc, aes(x = pathway, y=NES, fill=-log10(padj))) +
+  geom_bar(stat="identity") +
+  scale_fill_gradient(low="snow2", high=immune_cell_anno_colors[[2]]) +
+  theme_classic() +
+  coord_flip()
+  
+
+cd4_top10_p_uc
+
+```
+
+
+## CD8 memory pseudobulk
+
+```{r cd8 memory pseudobulk, echo=FALSE, message = FALSE}
+
+set.seed(10)
+
+cd8 <- subset(immune_cells, idents = "CD8_Memory")
+
+# Filter out those with fewer than 20 cells
+ncd8 <- ncells_per_sample_immune[ncells_per_sample_immune$Var1 == "CD8_Memory",] %>%
+  group_by(Var2) %>%
+  summarize(sum = sum(Freq))
+
+to_filter_cd8 <- ncd8[ncd8$sum < 20,]$Var2
+
+# filter
+cd8 <- subset(cd8, subset = orig.ident %in% to_filter_cd8, invert = TRUE)
+
+
+```
+
+
+```{r cd8 pseudobulk, echo=FALSE, message=FALSE}
+
+agg_cd8 <- AggregateExpression(cd8, group.by = c("orig.ident"))
+agg_cd8 <- as.data.frame(agg_cd8)
+colnames(agg_cd8) <- gsub("RNA\\.", "", colnames(agg_cd8))
+
+meta_cd8 <- metadata
+rownames(meta_cd8) <- gsub("-", "\\.", rownames(meta_cd8))
+coldata_cd8 <- meta_cd8[colnames(agg_cd8),]
+
+dds_cd8 <- DESeqDataSetFromMatrix(agg_cd8, colData = coldata_cd8, design=~disease_type)
+dds_cd8$disease_type <- relevel(dds_cd8$disease_type, ref = "HC")
+dds_cd8 <- dds_cd8[rowSums(counts(dds_cd8) >= 10) >= 4,]
+dds_cd8 <- DESeq2::DESeq(dds_cd8)
+res1_cd8 <- results(dds_cd8, name = "disease_type_PSCUC_vs_HC")
+res2_cd8 <- results(dds_cd8, name = "disease_type_UC_vs_HC")
+
+genes_psc_cd8 <- rownames(res1_cd8[res1_cd8$padj < 0.05 & !is.na(res1_cd8$padj),])
+genes_uc_cd8 <- rownames(res2_cd8[res2_cd8$padj < 0.05 & !is.na(res2_cd8$padj),])
+
+cd8_memory_volc <- volcano_plot(res1_cd8, use="padj") +
+  ggtitle("PSC-UC vs. Healthy") +
+  scale_color_manual(values = immune_cell_anno_colors[[4]]) +
+  theme(legend.position = "none")
+
+cd8_memory_volc_uc <- volcano_plot(res2_cd8, use="padj") +
+  ggtitle("UC vs. Healthy") +
+  scale_color_manual(values = immune_cell_anno_colors[[4]]) +
+  theme(legend.position = "none")
+
+ggsave(cd8_memory_volc, file = "export.dir/Figures/cd8_memory_volcano_caecum.pdf", height = 3, width=3)
+
+cd8_memory_volc
+cd8_memory_volc_uc
+
+
+```
+
+```{r table of differences cd8, echo=FALSE, message=FALSE}
+
+nup_psc <- nrow(res1_cd8[res1_cd8$padj < 0.05 & res1_cd8$log2FoldChange > 0 & !(is.na(res1_cd8$padj)),])
+nup_uc <- nrow(res2_cd8[res2_cd8$padj < 0.05 & res2_cd8$log2FoldChange > 0 & !(is.na(res2_cd8$padj)),])
+ndown_psc <- nrow(res1_cd8[res1_cd8$padj < 0.05 & res1_cd8$log2FoldChange < 0 & !(is.na(res1_cd8$padj)),])
+ndown_uc <- nrow(res2_cd8[res2_cd8$padj < 0.05 & res2_cd8$log2FoldChange < 0 & !(is.na(res2_cd8$padj)),])
+
+results_cd8 <- data.frame(comparison = resultsNames(dds_cd4)[2:3],
+                          no.up = c(nup_psc, nup_uc),
+                          no.down = c(ndown_psc, ndown_uc))
+
+knitr::kable(results_cd8)
+```
+
+## CD8 FGSEA
+
+```{r cd8 fgsea, echo=FALSE, message=FALSE}
+
+set.seed(10)
+
+cd8_genes <- res1_cd8$log2FoldChange
+names(cd8_genes) <- rownames(res1_cd8)
+
+# gene set enrichments
+cd8_fgsea <- fgsea::fgsea(pathways, cd8_genes, minSize=50)
+cd8_fgsea <- cd8_fgsea[order(cd8_fgsea$padj, decreasing = FALSE),]
+
+cd8_pathways_sig <- cd8_fgsea[cd8_fgsea$padj < 0.05,]
+
+cd8_top10 <- cd8_pathways_sig[1:9,]
+cd8_top10$pathway <- factor(cd8_top10$pathway, levels = cd8_top10$pathway)
+cd8_top10_p <- ggplot(cd8_top10, aes(x = pathway, y=NES, fill=-log10(padj))) +
+  geom_bar(stat="identity") +
+  scale_fill_gradient(low="snow2", high=immune_cell_anno_colors[[4]]) +
+  theme_classic() +
+  coord_flip()
+  
+ggsave(cd8_top10_p, file = "export.dir/Figures/cd8_memory_pathway_barplot_caecum.pdf", height=2.5, width=10)
+
+cd8_top10_p
+
+```
+
+
+## Compare significant pathways between CD4 and CD8 T cells
+
+```{r compare pathways T cells, echo=FALSE, message=FALSE}
+
+set.seed(10)
+
+pathways_cd4 <- cd4_fgsea[cd4_fgsea$padj < 0.05,]$pathway
+pathways_cd8 <- cd8_fgsea[cd8_fgsea$padj < 0.05,]$pathway
+
+library(VennDiagram)
+
+to_venn_t_cells <- list("CD4 pathways" = pathways_cd4,
+                        "CD8_pathways" = pathways_cd8)
+
+t_cell_pathway_overlap <- VennDiagram::venn.diagram(to_venn_t_cells,
+                                                    filename = NULL,
+                                                    fill = c(immune_cell_anno_colors[[2]],
+                                                             immune_cell_anno_colors[[4]]),
+                                                    alpha = 0.3,
+                                                    sub.fontfamily = "sans",
+                                                    )
+pdf("export.dir/Figures/overlap_t_cell_pathways_caecum.pdf", height=2, width=2.5)
+grid.draw(t_cell_pathway_overlap)
+dev.off()                          
+
+grid.draw(t_cell_pathway_overlap)
+
+```
+
+
+## Leading edge genes CD4
+
+Worth looking at which genes are in the cytokine production leading edge set for PSC-UC vs Healthy.
+
+
+```{r leading edge cytokine, echo=FALSE, message=FALSE}
+
+vst_cd4 <- assay(vst(dds_cd4))
+
+cd4_le <- unlist(cd4_fgsea[cd4_fgsea$pathway == "GO_CYTOKINE_PRODUCTION",]$leadingEdge)
+
+# Heatmap these genes in different T-cells
+vst_cd4_cytokine <- ScaleData(vst_cd4[cd4_le,])
+
+# sort out annotations for the disease states
+disease_anno <- HeatmapAnnotation("Disease type" = coldata$disease_type,
+                                  col = list("Disease type" = c("HC" = "grey",
+                                                                "PSCUC" = blues9[6],
+                                                                "UC" = "red3")))
+
+heat_colors <- colorRamp2(breaks = c(-2,0,2), colors = c("blue3", "white", "red3"))
+h1 <- Heatmap(vst_cd4_cytokine,
+              column_split = coldata$disease_type,
+              col = heat_colors,
+              cluster_columns = FALSE,
+              top_annotation = disease_anno,
+              show_column_names = FALSE,
+              rect_gp = gpar(col="white", lwd=0.5),
+              row_names_gp = gpar(fontsize=4))
+
+pdf("export.dir/Figures/heatmap_cytokine_t_cells_caecum.pdf", height=5, width=5)
+h1
+dev.off()
+h1
+
+
+OCMSutility::featurebox(as.data.frame(vst_cd4),
+                        as.data.frame(colData(dds_cd4)), features = c("CCL20", "GSTM2"), group_by = "disease_type") +
+  theme_classic() +
+  scale_color_manual(values = unlist(group_colors)) +
+  facet_wrap(~feature, scales = "free")
+```
+
+
+## B (plasma) IgA producing cell pseudobulk
+
+```{r iga cell clustering pseudobulk, echo=FALSE, message = FALSE}
+
+set.seed(10)
+
+iga <- subset(immune_cells, idents = "Plasma_Cell_IgA")
+
+iga <- ScaleData(iga, features = rownames(iga))
+iga <- FindVariableFeatures(iga, selection.method = "vst", nfeatures = 2000)
+iga <- RunPCA(iga, features = VariableFeatures(object = iga))
+
+# harmony integration: by individual = orig.ident
+iga <- iga %>% 
+RunHarmony("orig.ident", plot_convergence = TRUE)
+iga <- FindNeighbors(iga, reduction="harmony", dims = 1:30)
+iga <- FindClusters(iga, resolution = 0.8, algorithm = 4)
+iga <- RunUMAP(iga, dims = 1:30, reduction = "harmony")
+
+DimPlot(iga, reduction = "umap")
+
+# write the object out
+saveRDS(iga, file = "export.dir/Immune/caecum_iga.Rds")
+```
+
+
+
+```{r iga pseudobulk, echo=FALSE, message=FALSE}
+
+# get number of cells per sample
+knitr::kable(as.data.frame(table(iga@meta.data$orig.ident, iga@meta.data$annotation)))
+
+
+agg_iga <- AggregateExpression(iga, group.by = c("orig.ident"))
+agg_iga <- as.data.frame(agg_iga)
+colnames(agg_iga) <- gsub("RNA\\.", "", colnames(agg_iga))
+
+# remove immmunoglobulin genes
+agg_iga <- agg_iga[grep("^IG[K|H|L].*-.*", rownames(agg_iga), invert=TRUE),]
+
+
+meta_iga <- metadata
+rownames(meta_iga) <- gsub("-", "\\.", rownames(meta_iga))
+coldata_iga <- meta_iga[colnames(agg_iga),]
+
+dds_iga <- DESeqDataSetFromMatrix(agg_iga, colData = coldata_iga, design=~disease_type)
+dds_iga$disease_type <- relevel(dds_iga$disease_type, ref = "HC")
+dds_iga <- dds_iga[rowSums(counts(dds_iga) >= 10) >= 4,]
+dds_iga <- DESeq2::DESeq(dds_iga)
+res1_iga <- results(dds_iga, name = "disease_type_PSCUC_vs_HC")
+res2_iga <- results(dds_iga, name = "disease_type_UC_vs_HC")
+
+genes_psc_iga <- rownames(res1_iga[res1_iga$padj < 0.05 & !is.na(res1_iga$padj),])
+genes_uc_iga <- rownames(res2_iga[res2_iga$padj < 0.05 & !is.na(res2_iga$padj),])
+
+iga_volc <- volcano_plot(res1_iga, use="padj") +
+  ggtitle("PSC-UC vs. Healthy") +
+  scale_color_manual(values = immune_cell_anno_colors[[2]]) +
+  theme(legend.position = "none")
+
+iga_volc_uc <- volcano_plot(res2_iga, use="padj") +
+  ggtitle("UC vs. Healthy") +
+  scale_color_manual(values = immune_cell_anno_colors[[2]]) +
+  theme(legend.position = "none")
+
+ggsave(iga_volc, file = "export.dir/Figures/caecum_iga_volcano_psc.pdf", height = 3, width=3)
+
+iga_volc
+
+
+
+```
+
+
+```{r table of differences iga, echo=FALSE, message=FALSE}
+
+nup_psc <- nrow(res1_iga[res1_iga$padj < 0.05 & res1_iga$log2FoldChange > 0 & !(is.na(res1_iga$padj)),])
+nup_uc <- nrow(res2_iga[res2_iga$padj < 0.05 & res2_iga$log2FoldChange > 0 & !(is.na(res2_iga$padj)),])
+ndown_psc <- nrow(res1_iga[res1_iga$padj < 0.05 & res1_iga$log2FoldChange < 0 & !(is.na(res1_iga$padj)),])
+ndown_uc <- nrow(res2_iga[res2_iga$padj < 0.05 & res2_iga$log2FoldChange < 0 & !(is.na(res2_iga$padj)),])
+
+results_iga <- data.frame(comparison = resultsNames(dds_iga)[2:3],
+                          no.up = c(nup_psc, nup_uc),
+                          no.down = c(ndown_psc, ndown_uc))
+
+knitr::kable(results_iga)
+```
+
+## Feature boxplots of the changed genes in IgA plasma cells
+
+```{r featurebox gois iga, echo=FALSE, message=FALSE}
+
+vst_iga <- as.data.frame(assay(vst(dds_iga)))
+
+gois_iga <- OCMSutility::featurebox(vst_iga, coldata_iga, features=genes_psc_iga, group_by = "disease_type") +
+              theme_classic() +
+              facet_wrap(~feature, scales="free") +
+              scale_color_manual(values = rep(immune_cell_anno_colors[[2]], 3)) +
+  theme(legend.position = "none")
+
+ggsave(gois_iga, file = "export.dir/Figures/iga_gois_uc.pdf", height=6, width=6)
+
+gois_iga
+
+```
+
+## Plasma Cell IgA FGSEA
+
+
+```{r iga fgsea, echo=FALSE, message=FALSE}
+
+set.seed(10)
+
+iga_genes <- res1_iga$log2FoldChange
+names(iga_genes) <- rownames(res1_iga)
+
+# gene set enrichments
+iga_fgsea <- fgsea::fgsea(pathways, iga_genes, minSize=50)
+iga_fgsea <- iga_fgsea[order(iga_fgsea$padj, decreasing = FALSE),]
+iga_pathways_sig <- iga_fgsea[iga_fgsea$padj < 0.05,]
+
+iga_top10 <- iga_pathways_sig[1:10,]
+iga_top10$pathway <- factor(iga_top10$pathway, levels = iga_top10$pathway)
+iga_top10_p <- ggplot(iga_top10, aes(x = pathway, y=NES, fill=-log10(padj))) +
+  geom_bar(stat="identity") +
+  scale_fill_gradient(low="snow2", high=immune_cell_anno_colors[[2]]) +
+  theme_classic() +
+  coord_flip()
+  
+ggsave(iga_top10_p, file = "export.dir/Figures/iga_memory_pathway_barplot.pdf", height=2.5, width=10)
+
+iga_top10_p
+
+```
+
+## Where are these genes expressed
+
+```{r expression of iga genes across cell types, echo=FALSE, message=FALSE}
+iga_gois <- rownames(res1_iga[res1_iga$padj < 0.05 & !(is.na(res1_iga$padj)),])
+
+
+# Violin plot each goi separately as it is a bit annoying
+# to do the default seurat one
+iga_gois_p <- list()
+for (i in iga_gois){
+  p <- VlnPlot(immune_cells, features = i, pt.size = 0) +
+  scale_fill_manual(values = immune_cell_anno_colors) +
+  theme(legend.position = "none") 
+  iga_gois_p[[i]] <- p
+  ggsave(p, file = paste0("export.dir/Figures/", i, "_celltypes.pdf"), height=4, width=4)
+}
+
+gridExtra::grid.arrange(grobs = iga_gois_p, nrow=3)
+
+
+```
+
+
+## Featureplots of AMPD1 and CADM1
+
+```{r iga featureplots, echo = FALSE, message = FALSE}
+
+FeaturePlot(immune_cells, feature = c("AMPD1", "CADM1"), label = TRUE, split.by = "disease_type")
+
+FeatureScatter(iga, feature1 = "CADM1", feature2 = "AMPD1", split.by = "disease_type")
+
+```
+
+
+## Write out h5ad file for cellphoneDB
+
+```{r write h5ad, echo=FALSE, message=FALSE}
+
+# convert to h5ad
+library(SeuratDisk)
+
+immune_cells3 <- immune_cells
+
+immune_cells3[["RNA"]] <- as(object = immune_cells3[["RNA"]], Class = "Assay")
+immune_cells3 <- NormalizeData(immune_cells3)
+
+
+# save the whole thing
+SaveH5Seurat(immune_cells3, filename = "export.dir/immune_cells.h5Seurat", overwrite = TRUE)
+Convert("export.dir/immune_cells.h5Seurat", dest = "h5ad", overwrite = TRUE)
+
+# output metadata file for cellphonedb
+meta_barcodes <- data.frame("barcode_sample" = rownames(immune_cells3@meta.data),
+                            "cell_type" = immune_cells3@meta.data$annotation)
+
+write.table(meta_barcodes, file = "export.dir/meta_barcodes.txt",
+            sep="\t",
+            row.names = FALSE,
+            quote=FALSE)
+
+```
+
+

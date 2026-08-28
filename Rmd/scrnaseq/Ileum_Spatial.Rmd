@@ -1,0 +1,153 @@
+---
+title: "Spatial analysis of epithelial cells"
+output: html_document
+date: "2025-05-02"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Spatial organisation of enterocytes
+
+```{r spatial, echo=FALSE, message=FALSE}
+
+spatial_norm <- read.csv("../spatial_enterocytes/geomx_normalized_counts-2024-12-08.tsv",
+                         header=TRUE,
+                         stringsAsFactors = FALSE,
+                         row.names=1,
+                         sep="\t")
+
+spatial_metadata <- read.csv("../spatial_enterocytes/geomx_metadata-2024-12-08.tsv",
+                             header=TRUE,
+                             stringsAsFactors = FALSE,
+                             sep="\t")
+
+rownames(spatial_metadata) <- gsub("-", "\\.", spatial_metadata$file)
+
+spatial_metadata <- spatial_metadata[colnames(spatial_norm),]
+spatial_metadata <- spatial_metadata[spatial_metadata$file != "DSP-1001250001700-B-E03.dcc",]
+
+spatial_norm <- spatial_norm[,rownames(spatial_metadata)]
+
+# control for individual
+spatial_norm <- limma::removeBatchEffect(spatial_norm, batch=spatial_metadata$scan.name)
+
+source("~/devel/MIGTranscriptomeExplorer/R/MIGTranscriptome_retrieval.R")
+source("~/devel/MIGTranscriptomeExplorer/R/MIGTranscriptome_plotting.R")
+pc <- runPCA(spatial_norm) 
+
+spatial_metadata$feature <- gsub("([0-9]*)", "",gsub("=", "", spatial_metadata$roi))
+
+apoa1_cluster <- readRDS("export.dir/apoa1_cluster.Rds")
+gsta1_cluster <- readRDS("export.dir/gsta1_cluster.Rds")
+
+# marker_genes i.e. those correlated with APOA1 or GSTA1
+apoa1 <- rownames(apoa1_cluster[apoa1_cluster$Membership > 0.60,])
+gsta1 <- rownames(gsta1_cluster[gsta1_cluster$Membership > 0.60,])
+```
+
+## Number of genes in spatial that are in the different clusters
+
+```{r ngenes in clusters, echo=FALSE, message=FALSE}
+
+ngenes_gsta1 <- length(gsta1)
+ngenes_apoa1 <- length(apoa1)
+
+# get those that are present in both
+apo <- intersect(apoa1, rownames(spatial_norm))
+gst <- intersect(gsta1, rownames(spatial_norm))
+
+# proportion of genes
+(length(apo)/ngenes_apoa1)*100
+(length(gst)/ngenes_gsta1)*100
+
+spatial_metadata$disease_type <- ifelse(spatial_metadata$scan.name == "GI7723-Ileum", "Healthy", "PSC-UC")
+
+pc <- runPCA(spatial_norm[c(apo, gst), ]) 
+pc_spatial <- plotPrincipleComponents(pc, metadata=spatial_metadata, colourby = "feature", group="feature") +
+  theme_classic() +
+  stat_ellipse() +
+  scale_color_manual(values = c("black", "purple"))
+
+ggsave(pc_spatial, file="export.dir/Figures/pca_spatial.pdf", height=2.5, width=4)
+
+pc_spatial
+
+set.seed(10)
+vegan::adonis2(t(spatial_norm[c(apo, gst), ]) ~ feature, data = spatial_metadata, method = "euclidean")
+```
+
+## run linear models
+
+```{r linear models, echo=FALSE, message=FALSE}
+
+library(lmerTest)
+
+run_lmer <- function(row, metadata){
+  res <- summary(lmerTest::lmer(row ~ feature + (1|slide.name), data = metadata))
+  t <- res$coefficients[2,4]
+  p <- res$coefficients[2,5]
+  res <- data.frame(tvalue = t,
+                    pvalue = p)
+  return(res)
+}
+
+###########################
+
+x <- wilcox.test(spatial_norm[1,] ~ spatial_metadata$feature)
+
+run_wilcox <- function(row, metadata){
+  res <- wilcox.test(row ~ metadata$feature)
+  w <- res$statistic
+  p <- res$p.value
+  res <- data.frame(W = w,
+                    pvalue = p)
+  return(res)
+}
+
+test <- apply(spatial_norm[c(apo, gst),], 1, function(x) run_lmer(x, metadata = spatial_metadata))
+
+lmer_res <- bind_rows(test)
+rownames(lmer_res) <- names(test)
+lmer_res$padj <- p.adjust(lmer_res$pvalue, method="BH")
+lmer_res <- lmer_res[order(lmer_res$padj, decreasing=FALSE),]
+
+sig_spatial <- rownames(lmer_res[lmer_res$pvalue < 0.05,])
+
+knitr::kable(lmer_res)
+
+```
+
+
+## Heatmap
+
+```{r heatmap spatial, echo=FALSE, message=FALSE}
+
+colors <- colorRamp2(breaks = c(-2, 0, 2), colors = c("blue4", "white", "red4"))
+
+h_spatial <- Heatmap(as.data.frame(ScaleData(spatial_norm)[c(apo, gst),]), column_split = spatial_metadata$feature, show_column_names = FALSE, top_annotation = HeatmapAnnotation(feature = spatial_metadata$feature, col = list(feature = c("epithelium_base_" = "black", "epithelium_tip_" = "purple"))), row_split = c(rep("APOA1", length(apo)), rep("GSTA1", length(gst))), cluster_rows = FALSE, col=colors, cluster_columns = TRUE)
+
+pdf("export.dir/Figures/heatmap_spatial.pdf", height = 3, width =5)
+h_spatial
+dev.off()
+
+h_spatial
+```
+
+```{r misc}
+# correlations
+to_scatter_spatial <- data.frame(gene_name = rownames(spatial_norm),
+                                 Healthy = rowMeans(spatial_norm[,c("DSP.1001250001700.B.C12.dcc", "DSP.1001250001700.B.D01.dcc")]),
+                                 PSCUC = rowMeans(spatial_norm[,c("DSP.1001250001700.B.G02.dcc","DSP.1001250001700.B.G04.dcc")]))
+
+to_scatter_spatial$label <- ifelse(to_scatter_spatial$gene_name %in% gsta1, to_scatter_spatial$gene_name, NA)
+ggplot(to_scatter_spatial, aes(x = Healthy, y = PSCUC, color=label)) +
+  geom_point(alpha = 0.5) +
+  theme_classic() +
+  ggrepel::geom_text_repel(label = to_scatter_spatial$label) +
+  stat_smooth(method="lm")
+
+```
